@@ -15,8 +15,13 @@ import java.util.List;
 /**
  * Bounded in-memory ring buffer of captured interactions. Oldest entries are
  * evicted first; memory use is hard-capped by {@code capacity}.
+ * <p>
+ * This is the service-wide buffer the insights endpoint reads: one buffer for
+ * every session and every UI, holding only the interactions worth an insight.
+ * The dev-mode {@link ProfileStore} is the other {@link InteractionSink}, and
+ * keeps every interaction of every UI apart.
  */
-public class RecentInteractions {
+public class RecentInteractions implements InteractionSink {
 
     /** Default hard cap on retained interactions. */
     public static final int DEFAULT_CAPACITY = 100;
@@ -32,6 +37,7 @@ public class RecentInteractions {
         this.capacity = capacity;
     }
 
+    @Override
     public synchronized void add(CapturedInteraction interaction) {
         if (interactions.size() == capacity) {
             interactions.removeFirst();

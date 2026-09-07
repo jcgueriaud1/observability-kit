@@ -15,6 +15,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
 import io.micrometer.observation.ObservationRegistry;
 
+import com.vaadin.observability.micrometer.insights.ProfileStore;
 import com.vaadin.observability.micrometer.insights.RecentClientErrors;
 import com.vaadin.observability.micrometer.insights.RecentInteractions;
 import com.vaadin.observability.micrometer.insights.RecentQueries;
@@ -54,6 +55,13 @@ public final class ObservabilityKit {
      * endpoint.
      */
     private static final AtomicReference<RecentClientErrors> RECENT_CLIENT_ERRORS = new AtomicReference<>();
+
+    /**
+     * The development-mode profile store, recorded at {@code serviceInit} time
+     * like the buffers above but only when the deployment is not in production
+     * mode. Read by the dev-tools bridge behind the Copilot view profiler.
+     */
+    private static final AtomicReference<ProfileStore> PROFILE_STORE = new AtomicReference<>();
 
     private ObservabilityKit() {
     }
@@ -139,6 +147,25 @@ public final class ObservabilityKit {
         return RECENT_CLIENT_ERRORS.get();
     }
 
+    /**
+     * Records the development-mode profile store. Called from
+     * {@code MetricsServiceInitListener} for all deployment types, and only
+     * when the deployment is not in production mode.
+     */
+    static void setProfileStore(ProfileStore store) {
+        PROFILE_STORE.set(store);
+    }
+
+    /**
+     * The per-UI profile store, or {@code null} in production mode, where every
+     * interaction of every UI is deliberately not retained.
+     *
+     * @return the profile store, or {@code null}
+     */
+    public static ProfileStore getProfileStore() {
+        return PROFILE_STORE.get();
+    }
+
     static void setRecentInteractions(RecentInteractions buffer) {
         RECENT_INTERACTIONS.set(buffer);
     }
@@ -171,5 +198,6 @@ public final class ObservabilityKit {
         RECENT_INTERACTIONS.set(null);
         RECENT_QUERIES.set(null);
         RECENT_CLIENT_ERRORS.set(null);
+        PROFILE_STORE.set(null);
     }
 }

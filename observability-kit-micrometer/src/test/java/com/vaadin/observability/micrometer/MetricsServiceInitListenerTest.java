@@ -17,12 +17,15 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import com.vaadin.flow.component.ComponentEventListener;
+import com.vaadin.flow.component.DetachEvent;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.server.ErrorHandler;
 import com.vaadin.flow.server.ServiceInitEvent;
 import com.vaadin.flow.server.SessionDestroyListener;
 import com.vaadin.flow.server.SessionInitListener;
 import com.vaadin.flow.server.SessionLockRequestedEvent;
+import com.vaadin.flow.server.UIInitEvent;
 import com.vaadin.flow.server.UIInitListener;
 import com.vaadin.flow.server.VaadinRequestInterceptor;
 import com.vaadin.flow.server.VaadinService;
@@ -33,7 +36,9 @@ import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
 import com.vaadin.flow.server.communication.RpcInvocationFailedEvent;
 import com.vaadin.flow.server.communication.RpcInvocationStartedEvent;
 import com.vaadin.observability.micrometer.insights.CapturedInteraction;
+import com.vaadin.observability.micrometer.insights.ProfileStore;
 import com.vaadin.observability.micrometer.insights.RecentInteractions;
+import com.vaadin.pro.licensechecker.LicenseChecker;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -41,6 +46,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -529,6 +535,104 @@ class MetricsServiceInitListenerTest {
 
         Assertions.assertNull(ObservabilityKit.getRecentClientErrors(),
                 "no browser-error buffer when insights are off");
+    }
+
+    /**
+     * A development-mode service. Development mode is what the profile store
+     * hangs off, and it is also the mode that checks the license at runtime, so
+     * the checker is mocked out here — an unstubbed static {@code checkLicense}
+     * is a no-op, i.e. a valid license.
+     */
+    private static VaadinService devModeService() {
+        VaadinService service = mock(VaadinService.class, RETURNS_DEEP_STUBS);
+        when(service.getDeploymentConfiguration().isProductionMode())
+                .thenReturn(false);
+        when(service.getEventBus())
+                .thenReturn(new VaadinServiceEventBus(service));
+        return service;
+    }
+
+    /**
+     * Runs {@code serviceInit} in development mode and then fires one
+     * successful, well within budget RPC invocation for the given UI — the
+     * interaction the insights buffer is not interested in and a profiler
+     * exists for.
+     */
+    private static VaadinService initAndFireFastInvocation(UI ui) {
+        VaadinService service = devModeService();
+        ServiceInitEvent event = mock(ServiceInitEvent.class);
+        when(event.getSource()).thenReturn(service);
+
+        try (var licenseChecker = mockStatic(LicenseChecker.class)) {
+            new MetricsServiceInitListener().serviceInit(event);
+        }
+
+        VaadinServiceEventBus bus = service.getEventBus();
+        bus.fireEvent(rpcEvent(RpcInvocationStartedEvent.class, ui));
+        bus.fireEvent(rpcEvent(RpcInvocationEndedEvent.class, ui));
+        return service;
+    }
+
+    @Test
+    void profilesEveryInteractionOfAUiInDevelopmentMode() {
+        // The store is what answers "what did my click just cost": a click
+        // that neither failed nor missed the UX budget has to be in it.
+        ObservabilityKit.install(new SimpleMeterRegistry(),
+                ObservabilitySettings.builder().build());
+        UI ui = mock(UI.class, RETURNS_DEEP_STUBS);
+
+        initAndFireFastInvocation(ui);
+
+        ProfileStore store = ObservabilityKit.getProfileStore();
+        Assertions.assertNotNull(store,
+                "development mode should bind a profile store");
+        Assertions.assertEquals(1, store.profile(ui).size(),
+                "the fast, successful interaction should be profiled");
+        Assertions.assertTrue(
+                ObservabilityKit.getRecentInteractions().snapshot().isEmpty(),
+                "and must not reach the insights buffer, which keeps only "
+                        + "failed and over-budget interactions");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void closingATabDropsItsProfileInDevelopmentMode() {
+        ObservabilityKit.install(new SimpleMeterRegistry(),
+                ObservabilitySettings.builder().build());
+        UI ui = mock(UI.class, RETURNS_DEEP_STUBS);
+        VaadinService service = initAndFireFastInvocation(ui);
+
+        // The UI-init listeners the kit registered are what follow a tab; run
+        // them, then close the tab the way Flow closes it.
+        for (UIInitListener listener : registeredUiInitListeners(service)) {
+            listener.uiInit(new UIInitEvent(ui, service));
+        }
+        ArgumentCaptor<ComponentEventListener<DetachEvent>> captor = ArgumentCaptor
+                .forClass(ComponentEventListener.class);
+        verify(ui, atLeastOnce()).addDetachListener(captor.capture());
+        captor.getAllValues()
+                .forEach(l -> l.onComponentEvent(mock(DetachEvent.class)));
+
+        Assertions.assertTrue(
+                ObservabilityKit.getProfileStore().profile(ui).isEmpty(),
+                "a closed tab should not keep its profile");
+    }
+
+    @Test
+    void bindsNoProfileStoreInProductionMode() {
+        // Production keeps the insights buffer and nothing per UI: the store
+        // is a development-mode profiler, and its records would be memory a
+        // production deployment holds for nobody.
+        ObservabilityKit.install(new SimpleMeterRegistry(),
+                ObservabilitySettings.builder().build());
+
+        initAndFireFailedInvocation();
+
+        Assertions.assertNull(ObservabilityKit.getProfileStore(),
+                "no profile store in production mode");
+        Assertions.assertFalse(
+                ObservabilityKit.getRecentInteractions().snapshot().isEmpty(),
+                "while the insights buffer works as before");
     }
 
     private static CapturedInteraction interaction(String component) {

@@ -25,6 +25,7 @@ import com.vaadin.flow.server.VaadinServiceInitListener;
 import com.vaadin.observability.micrometer.insights.ClientErrorCollector;
 import com.vaadin.observability.micrometer.insights.DataQueryCollector;
 import com.vaadin.observability.micrometer.insights.InteractionCollector;
+import com.vaadin.observability.micrometer.insights.ProfileStore;
 import com.vaadin.observability.micrometer.insights.RecentClientErrors;
 import com.vaadin.observability.micrometer.insights.RecentInteractions;
 import com.vaadin.observability.micrometer.insights.RecentQueries;
@@ -240,7 +241,31 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
             event.getSource()
                     .addUIInitListener(uiEvent -> ObservabilityDevToolsClient
                             .inject(uiEvent.getUI()));
+            installProfiler(event.getSource(), s);
         }
+    }
+
+    /**
+     * Starts retaining every interaction of every UI, so the dev-tools panel
+     * can answer "what did my click just cost" for the developer's own tab.
+     * Development mode only: this is a second, threshold-less collector on top
+     * of the insights one, and neither the records nor the memory they take
+     * have any business in a production deployment.
+     * <p>
+     * What the store can hold is still what the collector captures: a
+     * successful interaction needs {@code requests}, a failed one needs
+     * {@code errors}. Both are on by default, so the profiler works out of the
+     * box, and an application that switched one of them off has switched off
+     * the events it would have profiled.
+     */
+    private static void installProfiler(VaadinService service,
+            ObservabilitySettings settings) {
+        ProfileStore profiles = new ProfileStore(settings);
+        InteractionCollector.retainingEverything(profiles, settings)
+                .register(service.getEventBus());
+        // Each UI drops its own records when its tab closes.
+        service.addUIInitListener(uiEvent -> profiles.track(uiEvent.getUI()));
+        ObservabilityKit.setProfileStore(profiles);
     }
 
     void bind(ServiceInitEvent event, MeterRegistry registry,

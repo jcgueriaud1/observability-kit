@@ -31,6 +31,11 @@ import com.vaadin.observability.micrometer.RouteTagResolver;
  * and ones slower than the {@link #UX_BUDGET_MS UX budget} (when request
  * metrics are enabled).
  * <p>
+ * What "interesting" means is the budget it was given, so the same collector
+ * also feeds the dev-mode {@link ProfileStore}, where a second instance created
+ * by {@link #retainingEverything} keeps every interaction instead — see that
+ * method.
+ * <p>
  * Listens for the RPC invocation events on the service event bus, the same
  * events {@code RpcMetricsBinder} uses for RPC spans:
  * {@link RpcInvocationFailedEvent} delivers the exact "user action + exception"
@@ -71,7 +76,13 @@ public class InteractionCollector {
 
     private static final int STACK_TOP_FRAMES = 5;
 
-    private final RecentInteractions buffer;
+    /**
+     * A budget no interaction can come in under, so every one of them is
+     * retained: a duration is never negative.
+     */
+    private static final long RETAIN_EVERYTHING = 0;
+
+    private final InteractionSink buffer;
     private final boolean captureErrors;
     private final boolean captureSlow;
     private final long uxBudgetMs;
@@ -88,17 +99,38 @@ public class InteractionCollector {
      */
     private final ThreadLocal<String> componentType = new ThreadLocal<>();
 
-    public InteractionCollector(RecentInteractions buffer,
+    public InteractionCollector(InteractionSink buffer,
             ObservabilitySettings settings) {
         this(buffer, settings, UX_BUDGET_MS);
+    }
+
+    /**
+     * A collector that retains every interaction it sees rather than only the
+     * interesting ones, by measuring against a budget of zero. What the
+     * dev-mode {@link ProfileStore} needs: a profiler has to be able to show
+     * the interaction the developer just performed, whether or not anything was
+     * wrong with it. Interactions captured this way therefore record a
+     * {@link CapturedInteraction#thresholdMs() threshold} of zero — they were
+     * measured against nothing.
+     *
+     * @param sink
+     *            where the captured interactions go, not {@code null}
+     * @param settings
+     *            instrumentation settings, not {@code null}
+     * @return a collector still to be {@link #register(VaadinServiceEventBus)
+     *         registered} on a service event bus
+     */
+    public static InteractionCollector retainingEverything(InteractionSink sink,
+            ObservabilitySettings settings) {
+        return new InteractionCollector(sink, settings, RETAIN_EVERYTHING);
     }
 
     /**
      * Test seam allowing the slow-interaction threshold to be overridden so
      * timing behaviour can be exercised without real delays.
      */
-    InteractionCollector(RecentInteractions buffer,
-            ObservabilitySettings settings, long uxBudgetMs) {
+    InteractionCollector(InteractionSink buffer, ObservabilitySettings settings,
+            long uxBudgetMs) {
         this.buffer = buffer;
         this.captureErrors = settings.isErrors();
         this.captureSlow = settings.isRequests();
