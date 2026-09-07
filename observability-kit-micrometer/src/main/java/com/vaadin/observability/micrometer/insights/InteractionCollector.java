@@ -163,6 +163,15 @@ public class InteractionCollector {
         componentType.set(
                 ComponentResolver.resolveComponentType(event).orElse(null));
         startNanos.set(System.nanoTime());
+        try {
+            // Opens the interaction the handler is about to run, so that what
+            // it does can be attributed to it as it happens. A no-op for the
+            // insights buffer, which keeps records and not children.
+            buffer.begin(event.getUI());
+        } catch (RuntimeException e) {
+            // Best-effort enrichment; never interfere with the invocation
+            // that is about to be handled.
+        }
     }
 
     void invocationFailed(RpcInvocationFailedEvent event) {

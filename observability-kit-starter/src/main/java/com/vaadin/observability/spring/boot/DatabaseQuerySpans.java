@@ -28,7 +28,7 @@ import com.vaadin.observability.micrometer.trace.ObservationNames;
  * when the span stops. The SQL text is attached only when statement capture is
  * enabled, since it is higher cardinality and may be sensitive.
  */
-final class DatabaseQuerySpans {
+final class DatabaseQuerySpans implements QueryObserver {
 
     private final ObservationRegistry observationRegistry;
     private final boolean captureStatement;
@@ -48,7 +48,8 @@ final class DatabaseQuerySpans {
      *            the SQL being executed, may be {@code null}
      * @return the in-flight span handle
      */
-    QuerySpan start(String sql) {
+    @Override
+    public QuerySpan start(String sql) {
         Observation observation = Observation
                 .createNotStarted(ObservationNames.DB_QUERY,
                         observationRegistry)
@@ -67,7 +68,7 @@ final class DatabaseQuerySpans {
      * the result-set close path and the statement-close leak guard can both
      * call it without double-stopping.
      */
-    static final class QuerySpan {
+    static final class QuerySpan implements QueryObserver.Query {
         private final Observation observation;
         private final AtomicBoolean stopped = new AtomicBoolean();
 
@@ -82,7 +83,8 @@ final class DatabaseQuerySpans {
          *            rows read, or a negative value when unknown (e.g. the
          *            result set was never closed)
          */
-        void stop(long rows) {
+        @Override
+        public void stop(long rows) {
             if (stopped.compareAndSet(false, true)) {
                 if (rows >= 0) {
                     observation.highCardinalityKeyValue(

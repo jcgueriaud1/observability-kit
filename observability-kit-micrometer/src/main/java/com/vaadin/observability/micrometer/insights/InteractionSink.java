@@ -8,6 +8,8 @@
  */
 package com.vaadin.observability.micrometer.insights;
 
+import com.vaadin.flow.component.UI;
+
 /**
  * Where an {@link InteractionCollector} puts what it captured.
  * <p>
@@ -28,4 +30,20 @@ public interface InteractionSink {
      *            the interaction to retain, never {@code null}
      */
     void add(CapturedInteraction interaction);
+
+    /**
+     * Signals that an interaction on the given UI is about to be handled,
+     * before anything it does has run.
+     * <p>
+     * A sink that only keeps records has nothing to do here. The
+     * {@link ProfileStore} does: an interaction it retains has children — the
+     * queries the handler runs — and those need something to belong to while
+     * the interaction itself is still in flight.
+     *
+     * @param ui
+     *            the UI handling the interaction, may be {@code null}
+     */
+    default void begin(UI ui) {
+        // Nothing to prepare for a sink that keeps only what it is handed.
+    }
 }

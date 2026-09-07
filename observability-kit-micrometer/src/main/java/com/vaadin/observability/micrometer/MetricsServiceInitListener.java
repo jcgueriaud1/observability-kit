@@ -236,12 +236,16 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
         // read the live meters regardless of deployment type.
         ObservabilityKit.setActiveMeterRegistry(r);
         ObservabilityUsage.markAsUsed(s);
-        bind(event, r, or, s);
+        // The profiler is installed before the instrumentation that feeds it:
+        // the data-query collector records its queries as children of the
+        // interaction they ran under, so it needs the store to exist.
+        ProfileStore profiles = productionMode ? null
+                : installProfiler(event.getSource(), s);
+        bind(event, r, or, s, profiles);
         if (!productionMode) {
             event.getSource()
                     .addUIInitListener(uiEvent -> ObservabilityDevToolsClient
                             .inject(uiEvent.getUI()));
-            installProfiler(event.getSource(), s);
         }
     }
 
@@ -256,9 +260,20 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
      * successful interaction needs {@code requests}, a failed one needs
      * {@code errors}. Both are on by default, so the profiler works out of the
      * box, and an application that switched one of them off has switched off
-     * the events it would have profiled.
+     * the events it would have profiled. The same goes for the queries an
+     * interaction ran: data provider queries reach the store through the
+     * collector {@link #bind} registers for the insights buffer, and JDBC
+     * queries through the wrapped {@code DataSource} of the Spring Boot
+     * starter, which is opt-in.
+     *
+     * @param service
+     *            the service being initialized, not {@code null}
+     * @param settings
+     *            instrumentation settings, not {@code null}
+     * @return the store now recording, so the instrumentation that feeds it can
+     *         be given it
      */
-    private static void installProfiler(VaadinService service,
+    private static ProfileStore installProfiler(VaadinService service,
             ObservabilitySettings settings) {
         ProfileStore profiles = new ProfileStore(settings);
         InteractionCollector.retainingEverything(profiles, settings)
@@ -266,11 +281,20 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
         // Each UI drops its own records when its tab closes.
         service.addUIInitListener(uiEvent -> profiles.track(uiEvent.getUI()));
         ObservabilityKit.setProfileStore(profiles);
+        return profiles;
     }
 
+    /**
+     * Registers the instrumentation the settings ask for.
+     *
+     * @param profiles
+     *            the development-mode profile store, or {@code null} in
+     *            production mode; the collectors that can attribute what they
+     *            see to an interaction record into it as well
+     */
     void bind(ServiceInitEvent event, MeterRegistry registry,
             ObservationRegistry observationRegistry,
-            ObservabilitySettings settings) {
+            ObservabilitySettings settings, ProfileStore profiles) {
         VaadinService service = event.getSource();
 
         if (settings.isSessions()) {
@@ -404,7 +428,7 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
             // in microseconds. Capture the queries themselves.
             RecentQueries queries = new RecentQueries(
                     settings.getInsightsCapacity());
-            new DataQueryCollector(queries, settings)
+            new DataQueryCollector(queries, profiles, settings)
                     .register(service.getEventBus());
             ObservabilityKit.setRecentQueries(queries);
         }

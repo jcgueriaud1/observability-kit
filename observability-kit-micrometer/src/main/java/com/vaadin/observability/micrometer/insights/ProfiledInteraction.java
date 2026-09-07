@@ -8,6 +8,8 @@
  */
 package com.vaadin.observability.micrometer.insights;
 
+import java.util.List;
+
 /**
  * One interaction retained by the dev-mode {@link ProfileStore}, with the id
  * the rest of the profile refers to it by.
@@ -26,6 +28,28 @@ package com.vaadin.observability.micrometer.insights;
  *            later interaction
  * @param interaction
  *            what was captured, exactly as the collector captured it
+ * @param queries
+ *            the queries this interaction ran, in the order they started, never
+ *            {@code null}
  */
-public record ProfiledInteraction(long id, CapturedInteraction interaction) {
+public record ProfiledInteraction(long id, CapturedInteraction interaction,
+        List<ProfiledQuery> queries) {
+
+    public ProfiledInteraction {
+        queries = queries == null ? List.of() : List.copyOf(queries);
+    }
+
+    /**
+     * The interaction's queries grouped by the statement they ran, most
+     * repeated first — "one query, run a hundred times" rather than a hundred
+     * lines.
+     * <p>
+     * Derived here rather than stored, so the store keeps one copy of the facts
+     * and a reader that only wants the total never pays for the grouping.
+     *
+     * @return one group per distinct statement, never {@code null}
+     */
+    public List<ProfiledQueryGroup> queryGroups() {
+        return ProfiledQueryGroup.group(queries);
+    }
 }

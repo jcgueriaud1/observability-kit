@@ -50,13 +50,13 @@ final class RowCountingDataSource implements DataSource {
 
     private final DataSource delegate;
     private final DatabaseFetchMetrics metrics;
-    private final DatabaseQuerySpans spans;
+    private final QueryObserver queries;
 
     RowCountingDataSource(DataSource delegate, DatabaseFetchMetrics metrics,
-            DatabaseQuerySpans spans) {
+            QueryObserver queries) {
         this.delegate = delegate;
         this.metrics = metrics;
-        this.spans = spans;
+        this.queries = queries;
     }
 
     @Override
@@ -95,11 +95,11 @@ final class RowCountingDataSource implements DataSource {
     }
 
     private ResultSet wrapResultSet(ResultSet resultSet,
-            DatabaseQuerySpans.QuerySpan span) {
+            QueryObserver.Query query) {
         if (resultSet == null) {
             return null;
         }
-        return new CountingResultSet(resultSet, span, metrics);
+        return new CountingResultSet(resultSet, query, metrics);
     }
 
     /**
@@ -143,12 +143,11 @@ final class RowCountingDataSource implements DataSource {
         /** SQL from prepareStatement/prepareCall, null for plain statements. */
         private final String preparedSql;
         /**
-         * Span for the in-flight query, not yet stopped. Stopped when its
-         * result set closes, when the statement is re-executed (the driver
-         * implicitly closes the prior result set), or by the close() leak
-         * guard.
+         * The in-flight query, not yet stopped. Stopped when its result set
+         * closes, when the statement is re-executed (the driver implicitly
+         * closes the prior result set), or by the close() leak guard.
          */
-        private DatabaseQuerySpans.QuerySpan pending;
+        private QueryObserver.Query pending;
 
         StatementHandler(Statement statement, String preparedSql) {
             this.statement = statement;
@@ -164,26 +163,27 @@ final class RowCountingDataSource implements DataSource {
             boolean producesQuery = name.equals("executeQuery")
                     || name.equals("execute");
             // A new execution implicitly closes any result set still open on
-            // this statement, so stop the previous span first — its result-set
-            // close never reaches our proxy, and it would otherwise be
-            // orphaned.
+            // this statement, so stop the previous query first — its
+            // result-set close never reaches our proxy, and it would otherwise
+            // be orphaned.
             if (producesQuery && pending != null) {
                 pending.stop(-1);
                 pending = null;
             }
-            // Start the span before executing so it brackets the DB round trip.
-            DatabaseQuerySpans.QuerySpan span = spans != null && producesQuery
-                    ? spans.start(sqlFor(args))
+            // Start observing before executing, so the observation brackets
+            // the DB round trip.
+            QueryObserver.Query query = queries != null && producesQuery
+                    ? queries.start(sqlFor(args))
                     : null;
-            if (span != null) {
-                pending = span;
+            if (query != null) {
+                pending = query;
             }
             Object result;
             try {
                 result = RowCountingDataSource.invoke(statement, method, args);
             } catch (Throwable t) {
-                if (span != null) {
-                    span.stop(-1);
+                if (query != null) {
+                    query.stop(-1);
                     pending = null;
                 }
                 throw t;
@@ -193,12 +193,12 @@ final class RowCountingDataSource implements DataSource {
                 if (result instanceof ResultSet resultSet) {
                     return wrapResultSet(resultSet, pending);
                 }
-                // No result set (unusual) — don't leak the span.
+                // No result set (unusual) — don't leave the query open.
                 stopPending();
             }
             case "execute" -> {
-                // A false return means an update, not a query: close the span
-                // now, since no result set will be fetched.
+                // A false return means an update, not a query: end the
+                // observation now, since no result set will be fetched.
                 if (Boolean.FALSE.equals(result)) {
                     stopPending();
                 }
@@ -209,7 +209,8 @@ final class RowCountingDataSource implements DataSource {
                 }
             }
             case "close" -> {
-                // Result set never closed: stop the span so it isn't orphaned.
+                // Result set never closed: stop the query so it isn't
+                // orphaned.
                 stopPending();
             }
             default -> {
