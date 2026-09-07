@@ -34,7 +34,7 @@ import java.util.Map;
 /**
  * A concrete {@link ResultSet} delegate that counts rows as they are read and
  * reports the total to {@link DatabaseFetchMetrics} (and, when present, the
- * query span) when the result set closes.
+ * {@link QueryObserver} watching the query) when the result set closes.
  * <p>
  * Unlike a JDK dynamic proxy, every method here forwards with a direct call, so
  * the hot path -- {@code next()} and the per-column getters invoked once per
@@ -50,15 +50,15 @@ import java.util.Map;
 final class CountingResultSet implements ResultSet {
 
     private final ResultSet delegate;
-    private final DatabaseQuerySpans.QuerySpan span;
+    private final QueryObserver.Query query;
     private final DatabaseFetchMetrics metrics;
     private long rows;
     private boolean recorded;
 
-    CountingResultSet(ResultSet delegate, DatabaseQuerySpans.QuerySpan span,
+    CountingResultSet(ResultSet delegate, QueryObserver.Query query,
             DatabaseFetchMetrics metrics) {
         this.delegate = delegate;
-        this.span = span;
+        this.query = query;
         this.metrics = metrics;
     }
 
@@ -84,8 +84,8 @@ final class CountingResultSet implements ResultSet {
         if (!recorded) {
             recorded = true;
             metrics.recordFetch(rows);
-            if (span != null) {
-                span.stop(rows);
+            if (query != null) {
+                query.stop(rows);
             }
         }
     }

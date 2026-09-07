@@ -753,6 +753,12 @@ The span does not include the SQL text by default. Set
 statement as `db.statement` — useful for pinpointing the offending query, but
 opt-in because SQL is higher cardinality and can be sensitive.
 
+The property governs the span, which is exported. In development mode each
+query is also kept in memory as part of the interaction that ran it, SQL
+included, so the dev-tools view profiler can list the queries behind a click;
+those records are read by that developer's own browser and are never exported
+or retained in production mode.
+
 ## Tracing
 
 When tracing is enabled (the default) and an `ObservationRegistry` is available,

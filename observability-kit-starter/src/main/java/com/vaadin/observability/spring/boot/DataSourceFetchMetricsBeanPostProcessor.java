@@ -21,8 +21,9 @@ import com.vaadin.observability.micrometer.ObservabilitySettings;
 /**
  * Wraps every {@link DataSource} bean in a {@link RowCountingDataSource} so the
  * kit records {@code vaadin.db.fetch.rows} — and, when tracing is enabled,
- * emits a {@code vaadin.db.query} span per query — without any application
- * code.
+ * emits a {@code vaadin.db.query} span per query, and in development mode
+ * records each query under the interaction that ran it — without any
+ * application code.
  * <p>
  * The {@link MeterRegistry} and {@link ObservationRegistry} are resolved lazily
  * through {@link ObjectProvider}s rather than injected, so this post-processor
@@ -34,6 +35,7 @@ class DataSourceFetchMetricsBeanPostProcessor implements BeanPostProcessor {
     private final ObjectProvider<MeterRegistry> meterRegistry;
     private final ObjectProvider<ObservationRegistry> observationRegistry;
     private final ObjectProvider<ObservabilitySettings> settings;
+    private final DatabaseQueryProfiler profiler = new DatabaseQueryProfiler();
     private volatile DatabaseFetchMetrics metrics;
     private volatile DatabaseQuerySpans spans;
 
@@ -53,7 +55,8 @@ class DataSourceFetchMetricsBeanPostProcessor implements BeanPostProcessor {
                 && !(bean instanceof RowCountingDataSource)) {
             DatabaseFetchMetrics m = metrics();
             if (m != null) {
-                return new RowCountingDataSource(dataSource, m, spans());
+                return new RowCountingDataSource(dataSource, m,
+                        QueryObserver.composite(spans(), profiler));
             }
         }
         return bean;

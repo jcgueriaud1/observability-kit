@@ -23,6 +23,7 @@ import com.vaadin.flow.server.data.DataFetchStartedEvent;
 import com.vaadin.flow.shared.Registration;
 import com.vaadin.observability.micrometer.ObservabilitySettings;
 import com.vaadin.observability.micrometer.RouteTagResolver;
+import com.vaadin.observability.micrometer.VaadinTelemetryContext;
 
 /**
  * Captures data provider queries worth surfacing: ones that threw, and ones
@@ -38,6 +39,12 @@ import com.vaadin.observability.micrometer.RouteTagResolver;
  * interaction is measured against: a query is part of what the user waits for,
  * so it earns attention at the same point.
  * <p>
+ * <b>The dev-mode profile store, when there is one, is fed differently.</b>
+ * Every count and every fetch is recorded there as a child of the interaction
+ * it ran under, fast ones included, because a profiler answers "what did my
+ * click just cost" and eleven fast queries is the answer it exists to give. The
+ * threshold above governs only what reaches the service-wide insights buffer.
+ * <p>
  * <b>Threading.</b> The events of one query arrive on the same thread, so the
  * start time lives in a thread local. Count and fetch keep separate slots
  * because an asynchronous component runs its fetches on its own executor while
@@ -46,6 +53,8 @@ import com.vaadin.observability.micrometer.RouteTagResolver;
 public class DataQueryCollector {
 
     private final RecentQueries buffer;
+    /** The dev-mode store, or {@code null} in production mode. */
+    private final ProfileStore profiles;
     private final boolean captureErrors;
     private final boolean captureSlow;
     private final long uxBudgetMs;
@@ -56,16 +65,33 @@ public class DataQueryCollector {
 
     public DataQueryCollector(RecentQueries buffer,
             ObservabilitySettings settings) {
-        this(buffer, settings, InteractionCollector.UX_BUDGET_MS);
+        this(buffer, null, settings, InteractionCollector.UX_BUDGET_MS);
+    }
+
+    /**
+     * A collector that also records every query it sees into the development
+     * mode profile store, as a child of the interaction it ran under.
+     *
+     * @param buffer
+     *            the insights buffer, which keeps only failed and slow queries
+     * @param profiles
+     *            the dev-mode profile store, or {@code null} for none
+     * @param settings
+     *            instrumentation settings, not {@code null}
+     */
+    public DataQueryCollector(RecentQueries buffer, ProfileStore profiles,
+            ObservabilitySettings settings) {
+        this(buffer, profiles, settings, InteractionCollector.UX_BUDGET_MS);
     }
 
     /**
      * Test seam allowing the slow-query threshold to be overridden so timing
      * behaviour can be exercised without real delays.
      */
-    DataQueryCollector(RecentQueries buffer, ObservabilitySettings settings,
-            long uxBudgetMs) {
+    DataQueryCollector(RecentQueries buffer, ProfileStore profiles,
+            ObservabilitySettings settings, long uxBudgetMs) {
         this.buffer = buffer;
+        this.profiles = profiles;
         this.captureErrors = settings.isErrors();
         this.captureSlow = settings.isRequests();
         this.uxBudgetMs = uxBudgetMs;
@@ -105,13 +131,19 @@ public class DataQueryCollector {
         }
         capture(CapturedQuery.KIND_COUNT, event.getUI(),
                 event.getComponent().orElse(null), event.isFiltered(), -1, -1,
-                -1, elapsedMs(countStart), -1, CapturedQuery.OUTCOME_ERROR,
-                event.getError());
+                -1, elapsedMs(countStart.get()), -1,
+                CapturedQuery.OUTCOME_ERROR, event.getError());
     }
 
     void countEnded(DataCountEndedEvent event) {
-        long durationMs = elapsedMs(countStart);
+        Long startedNanos = countStart.get();
+        long durationMs = elapsedMs(startedNanos);
         countStart.remove();
+        // Recorded for the profiler whether or not it was slow, and whether or
+        // not it threw: a count that failed is still something the click did.
+        profile(CapturedQuery.KIND_COUNT, event.getUI(),
+                event.getComponent().orElse(null), event.isFiltered(), -1, -1,
+                event.getCount(), durationMs, startedNanos);
         // A failed count is already captured with its throwable; -1 here only
         // says the query threw.
         if (event.getCount() < 0 || !captureSlow || durationMs < uxBudgetMs) {
@@ -133,13 +165,19 @@ public class DataQueryCollector {
         }
         capture(CapturedQuery.KIND_FETCH, event.getUI(),
                 event.getComponent().orElse(null), event.isFiltered(),
-                event.getOffset(), event.getLimit(), -1, elapsedMs(fetchStart),
-                -1, CapturedQuery.OUTCOME_ERROR, event.getError());
+                event.getOffset(), event.getLimit(), -1,
+                elapsedMs(fetchStart.get()), -1, CapturedQuery.OUTCOME_ERROR,
+                event.getError());
     }
 
     void fetchEnded(DataFetchEndedEvent event) {
-        long durationMs = elapsedMs(fetchStart);
+        Long startedNanos = fetchStart.get();
+        long durationMs = elapsedMs(startedNanos);
         fetchStart.remove();
+        profile(CapturedQuery.KIND_FETCH, event.getUI(),
+                event.getComponent().orElse(null), event.isFiltered(),
+                event.getOffset(), event.getLimit(), event.getRowsReturned(),
+                durationMs, startedNanos);
         if (event.getRowsReturned() < 0 || !captureSlow
                 || durationMs < uxBudgetMs) {
             return;
@@ -169,10 +207,58 @@ public class DataQueryCollector {
         }
     }
 
-    private long elapsedMs(ThreadLocal<Long> start) {
-        Long started = start.get();
-        return started == null ? -1
-                : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+    /**
+     * Records the query as a child of the interaction the UI is handling.
+     * <p>
+     * The interaction is read from the UI the event carries rather than from
+     * the current thread, because an asynchronous component fetches on its own
+     * executor: there is no current UI there, but the query is still part of
+     * the click that asked for the data.
+     */
+    private void profile(String kind, UI ui, Component component,
+            boolean filtered, int offset, int limit, int rows, long durationMs,
+            Long startedNanos) {
+        if (profiles == null || startedNanos == null) {
+            return;
+        }
+        long interactionId = VaadinTelemetryContext.interactionId(ui);
+        if (interactionId == VaadinTelemetryContext.NO_INTERACTION) {
+            return;
+        }
+        try {
+            profiles.addQuery(interactionId, kind,
+                    describe(component, offset, limit, filtered), rows,
+                    durationMs, startedNanos);
+        } catch (RuntimeException e) {
+            // Best-effort, as in capture(): a profiler must never be what
+            // breaks data loading.
+        }
+    }
+
+    /**
+     * What a data provider query has instead of a statement: who asked, and for
+     * what. Written so that the pages of one scrolling component reduce to one
+     * {@link ProfiledQueryGroup} once the range is parameterised away.
+     */
+    private static String describe(Component component, int offset, int limit,
+            boolean filtered) {
+        StringBuilder description = new StringBuilder(
+                component == null ? "data provider"
+                        : component.getClass().getName());
+        if (offset >= 0 || limit >= 0) {
+            description.append(" [").append(offset).append(", ").append(limit)
+                    .append(']');
+        }
+        if (filtered) {
+            description.append(" (filtered)");
+        }
+        return description.toString();
+    }
+
+    private long elapsedMs(Long startedNanos) {
+        return startedNanos == null ? -1
+                : TimeUnit.NANOSECONDS
+                        .toMillis(System.nanoTime() - startedNanos);
     }
 
 }
