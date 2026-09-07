@@ -7,7 +7,7 @@ target/
 node_modules/
 frontend/generated/
 src/main/frontend/generated/
-src/main/bundles/
+**/src/main/bundles/
 vite.generated.ts
 types.d.ts
 .flow/
