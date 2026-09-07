@@ -162,6 +162,47 @@ The built-in server-side request timer is `vaadin.request.duration`, and
 server-side RPC invocations are timed as `vaadin.rpc.duration`. See
 [Metrics](#metrics) for the full list.
 
+## Development-mode panels
+
+In development mode the kit adds two panels to Vaadin Copilot. Neither exists in
+production: they are loaded over the dev-tools connection, which a production
+deployment does not have, and nothing they read is exported anywhere.
+
+**Observability** shows every `vaadin.*` meter in the registry, with a sparkline
+of recent values. That is the whole application — every user and every view —
+which is what a meter holds.
+
+**View profiler** answers a narrower question: what did *my* click just cost. It
+shows the developer's own tab, newest interaction first, and for each one:
+
+- the server time it took, and whether it failed;
+- the queries it ran, counted. The headline is `101 queries in 612 ms · 1
+  statement × 100`, which is how a grid that looks up one row at a time reads:
+  not a hundred different queries but one query run a hundred times. Opening an
+  interaction lists the statements behind it, most repeated first;
+- the application code frame it went through, and the exception if it threw one;
+- what the tab is holding right now — nodes, components, views, stale views —
+  and how long ago that was measured.
+
+Below the interactions are the meters attributed to the route the tab is on,
+which is the one place the two panels meet: what this view costs everyone, next
+to what it just cost you.
+
+The profiler is scoped to the developer's own session. A tab is addressed by its
+UI id, and the server resolves that id only within the session the dev-tools
+connection belongs to, so an id from someone else's session finds nothing — a UI
+id is a small integer unique only within a session, and guessing one must not
+read another user's tab.
+
+What the profiler can show is what the kit captured. A successful interaction
+needs `requests`, a failed one needs `errors`, and both are on by default. SQL
+text is kept for the profiler regardless of `database-statement`, which governs
+what goes on an exported span; the statements stay in memory on the developer's
+own machine. UI state is measured for the profiler whether or not `ui-state` is
+on, since "how much is this view holding" is a question about one tab and the
+gauges are aggregates. See [UI state size](#ui-state-size) and [Database fetch
+size](#database-fetch-size).
+
 ## Other setups
 
 ### Plain Spring (without Spring Boot)
