@@ -80,12 +80,12 @@ class MetricsServiceInitListenerLicenseTest {
             new MetricsServiceInitListener().serviceInit(event);
         }
 
-        // Three UI init listeners in development mode: the UiMetricsBinder,
+        // Four UI init listeners in development mode: the UiMetricsBinder,
         // the ErrorMetricsBinder (which re-instruments the session error
-        // handler), and the dev-tools Copilot panel injector (the last is
-        // skipped in production - see
-        // productionMode_registersWithoutCheckingLicense).
-        verify(service, times(3)).addUIInitListener(any(UIInitListener.class));
+        // handler), the dev-tools Copilot panel injector, and the profile
+        // store following the tab (the last two are skipped in production -
+        // see productionMode_registersWithoutCheckingLicense).
+        verify(service, times(4)).addUIInitListener(any(UIInitListener.class));
         // Two request interceptors: request timing/errors, and the navigation
         // binder closing out navigations that never complete.
         verify(event, times(2)).addVaadinRequestInterceptor(
