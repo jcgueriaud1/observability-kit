@@ -26,6 +26,7 @@ import com.vaadin.flow.router.Location;
 import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
 import com.vaadin.flow.server.communication.RpcInvocationStartedEvent;
 import com.vaadin.observability.micrometer.ObservabilitySettings;
+import com.vaadin.observability.micrometer.UiStateSample;
 import com.vaadin.observability.micrometer.VaadinTelemetryContext;
 import com.vaadin.observability.micrometer.insights.ProfileStore.UiKey;
 
@@ -48,6 +49,11 @@ class ProfileStoreTest {
                 "com.example.OrdersGrid", event, "event",
                 CapturedInteraction.OUTCOME_SUCCESS, 300, 0, true, null, null,
                 null, null, sessionId, uiId);
+    }
+
+    /** A measurement of a tab holding the given number of nodes. */
+    private static UiStateSample state(int nodes) {
+        return new UiStateSample(nodes, nodes / 10, 1, 0, System.nanoTime());
     }
 
     private static List<String> events(List<ProfiledInteraction> profile) {
@@ -459,6 +465,111 @@ class ProfileStoreTest {
                 .get(0);
         Assertions.assertEquals("click", profiled.interaction().event());
         Assertions.assertTrue(profiled.queries().isEmpty());
+    }
+
+    @Test
+    void aTabReportsTheStateItWasLastMeasuredToHold() {
+        // "How much memory is my view holding" is the question, and the answer
+        // is about the tab as it is now — so a second measurement replaces the
+        // first rather than joining it.
+        UI ui = tab("session-a", 0);
+
+        store.uiStateSampled(ui, state(120));
+        store.uiStateSampled(ui, state(4000));
+
+        Assertions.assertEquals(4000, store.uiState(ui).nodes());
+    }
+
+    @Test
+    void aTabIsMeasuredEvenBeforeItHasInteracted() {
+        // Navigating to a view is measured where the navigation happens, which
+        // is before anything has been clicked in it. That state is exactly what
+        // the panel opens on.
+        UI ui = tab("session-a", 0);
+
+        store.uiStateSampled(ui, state(4000));
+
+        Assertions.assertEquals(4000, store.uiState(ui).nodes());
+        Assertions.assertTrue(store.profile(ui).isEmpty(),
+                "and it has done nothing yet");
+    }
+
+    @Test
+    void eachTabHoldsItsOwnState() {
+        // The developer looking at their grid tab must not be shown what the
+        // login tab next to it holds.
+        UI first = tab("session-a", 0);
+        UI second = tab("session-a", 1);
+
+        store.uiStateSampled(first, state(120));
+        store.uiStateSampled(second, state(4000));
+
+        Assertions.assertEquals(120, store.uiState(first).nodes());
+        Assertions.assertEquals(4000, store.uiState(second).nodes());
+    }
+
+    @Test
+    void twoSessionsDoNotShareAState() {
+        // The uiId alone cannot key a measurement either: two users' first
+        // tabs are both UI 0.
+        UI ui = tab("session-a", 0);
+        UI otherUser = tab("session-b", 0);
+
+        store.uiStateSampled(ui, state(4000));
+        store.uiStateSampled(otherUser, state(70));
+
+        Assertions.assertEquals(4000, store.uiState(ui).nodes());
+        Assertions.assertEquals(70, store.uiState(otherUser).nodes());
+    }
+
+    @Test
+    void anUnmeasuredTabHasNoState() {
+        // The store never measures anything itself, so having no figure is a
+        // normal answer: UI-state instrumentation may not have run yet.
+        store.add(interaction("session-a", 0, "click"));
+
+        Assertions.assertNull(store.uiState(tab("session-a", 0)),
+                "an interaction is not a measurement");
+        Assertions.assertNull(store.uiState((UI) null),
+                "no UI to report on is not a failure");
+        Assertions.assertNull(store.uiState(tab("session-b", 7)),
+                "and neither is a tab the store has never seen");
+    }
+
+    @Test
+    void aMeasurementOfNoTabIsIgnored() {
+        Assertions.assertDoesNotThrow(() -> {
+            store.uiStateSampled(null, state(120));
+            store.uiStateSampled(tab("session-a", 0), null);
+        });
+        Assertions.assertEquals(0, store.trackedUis());
+    }
+
+    @Test
+    void closingATabDropsTheStateItHeld() {
+        UI ui = tab("session-a", 0);
+        store.track(ui);
+        store.uiStateSampled(ui, state(4000));
+
+        close(ui);
+
+        Assertions.assertNull(store.uiState(ui),
+                "a closed tab holds no state, and the store holds none of it");
+    }
+
+    @Test
+    void theStateOfAnEvictedProfileGoesWithIt() {
+        // A tab whose detach never runs is evicted by the UI limit; its state
+        // sample must not be what outlives it.
+        UI evicted = tab("session-a", 0);
+        store.uiStateSampled(evicted, state(4000));
+        for (int uiId = 1; uiId <= MAX_UIS; uiId++) {
+            store.uiStateSampled(tab("session-a", uiId), state(120));
+        }
+
+        Assertions.assertEquals(MAX_UIS, store.trackedUis(),
+                "a tab that is only measured still counts against the limit");
+        Assertions.assertNull(store.uiState(evicted));
     }
 
     @Test

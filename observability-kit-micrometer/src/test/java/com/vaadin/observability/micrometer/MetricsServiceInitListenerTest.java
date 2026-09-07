@@ -595,6 +595,49 @@ class MetricsServiceInitListenerTest {
     }
 
     @Test
+    void measuresUiStateForTheProfilerWhileTheGaugesStayOptIn() {
+        // What a view holds is the Vaadin-specific figure the panel is opened
+        // for, so it has to be there in development mode without the developer
+        // turning on a production setting — and turning none on has to stay
+        // exactly what it means for the exported aggregates.
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        ObservabilityKit.install(registry,
+                ObservabilitySettings.builder().build());
+        VaadinService service = devModeService();
+        ServiceInitEvent event = mock(ServiceInitEvent.class);
+        when(event.getSource()).thenReturn(service);
+        try (var licenseChecker = mockStatic(LicenseChecker.class)) {
+            new MetricsServiceInitListener().serviceInit(event);
+        }
+        UI ui = uiWithRealTree();
+
+        for (UIInitListener listener : registeredUiInitListeners(service)) {
+            listener.uiInit(new UIInitEvent(ui, service));
+        }
+
+        UiStateSample sample = ObservabilityKit.getProfileStore().uiState(ui);
+        Assertions.assertNotNull(sample,
+                "development mode should measure a new tab for the profiler");
+        Assertions.assertTrue(sample.nodes() > 0,
+                "and the measurement should be of the tab's actual tree, got "
+                        + sample.nodes());
+        Assertions.assertNull(registry.find(MeterNames.UI_STATE_NODES).gauge(),
+                "while ui-state is off, so no aggregate is published");
+    }
+
+    /**
+     * A UI whose state tree is Flow's own, so that measuring it finds
+     * something: a mock has no tree at all.
+     */
+    private static UI uiWithRealTree() {
+        UI real = new UI();
+        UI ui = mock(UI.class, RETURNS_DEEP_STUBS);
+        when(ui.getElement()).thenReturn(real.getElement());
+        when(ui.getInternals()).thenReturn(real.getInternals());
+        return ui;
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void closingATabDropsItsProfileInDevelopmentMode() {
         ObservabilityKit.install(new SimpleMeterRegistry(),

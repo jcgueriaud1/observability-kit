@@ -386,12 +386,22 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
                     .register(service.getEventBus());
         }
 
-        if (settings.isUiState()) {
+        if (settings.isUiState() || profiles != null) {
             // One binder, three subscriptions: UIs report their own state size
             // at init and after navigation, any RPC invocation refreshes the
             // UI it touched, and a destroyed session drops the UIs it held.
+            //
+            // The gauges stay opt-in, the measurement does not: in development
+            // mode it also runs for the profile store, which needs the per-UI
+            // figure the aggregates cannot carry, so the dev-tools panel works
+            // without asking the developer to turn a production setting on. A
+            // walk is the cost of this feature, and this way there is one of
+            // them however many consumers asked.
             UiStateMetricsBinder uiStateBinder = new UiStateMetricsBinder(
-                    registry, settings);
+                    settings, profiles);
+            if (settings.isUiState()) {
+                uiStateBinder.bindGauges(registry);
+            }
             service.addUIInitListener(uiStateBinder);
             service.addSessionDestroyListener(uiStateBinder);
             uiStateBinder.register(service.getEventBus());

@@ -24,6 +24,7 @@ import com.vaadin.flow.component.DetachEvent;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.shared.Registration;
 import com.vaadin.observability.micrometer.ObservabilitySettings;
+import com.vaadin.observability.micrometer.UiStateSample;
 import com.vaadin.observability.micrometer.VaadinTelemetryContext;
 
 /**
@@ -50,6 +51,14 @@ import com.vaadin.observability.micrometer.VaadinTelemetryContext;
  * {@link VaadinTelemetryContext#setCurrentInteraction}: a query running on the
  * request thread can read it there without the code that runs it knowing
  * anything about Vaadin.
+ * <p>
+ * <strong>Interactions are not all a tab has.</strong> How much state the tab
+ * itself holds — nodes, components, retained views — is the Vaadin-specific
+ * figure a profiler is asked for, and it belongs to the tab rather than to any
+ * one of its interactions, so it is kept beside them as the latest
+ * {@link #uiStateSampled measurement} of that UI. The store does not measure
+ * anything itself: the walk is the one the UI-state instrumentation already
+ * does under the session lock, handed over rather than repeated.
  * <p>
  * <strong>Only in development mode.</strong> The store is created by
  * {@code MetricsServiceInitListener} next to the dev-tools client injection and
@@ -100,9 +109,9 @@ public class ProfileStore implements InteractionSink {
     /**
      * Access-ordered, so the eldest entry the cap evicts is the tab that has
      * gone longest without recording or being read, rather than the one that
-     * opened first. Guarded by {@code this}, like the buffers it holds.
+     * opened first. Guarded by {@code this}, like the profiles it holds.
      */
-    private final Map<UiKey, Deque<Entry>> profiles;
+    private final Map<UiKey, Profile> profiles;
 
     /**
      * Every held entry by its id, so a query can find the interaction it ran
@@ -141,11 +150,11 @@ public class ProfileStore implements InteractionSink {
 
             @Override
             protected boolean removeEldestEntry(
-                    Map.Entry<UiKey, Deque<Entry>> eldest) {
+                    Map.Entry<UiKey, Profile> eldest) {
                 if (size() <= maxUis) {
                     return false;
                 }
-                forget(eldest.getValue());
+                forget(eldest.getValue().interactions);
                 return true;
             }
         };
@@ -241,11 +250,11 @@ public class ProfileStore implements InteractionSink {
      * {@code null} when every entry it has is complete.
      */
     private Entry pending(UiKey key) {
-        Deque<Entry> buffer = profiles.get(key);
-        if (buffer == null) {
+        Profile profile = profiles.get(key);
+        if (profile == null) {
             return null;
         }
-        for (Entry entry : buffer.reversed()) {
+        for (Entry entry : profile.interactions.reversed()) {
             if (entry.interaction == null) {
                 return entry;
             }
@@ -258,8 +267,7 @@ public class ProfileStore implements InteractionSink {
      * full.
      */
     private void retain(UiKey key, Entry entry) {
-        Deque<Entry> buffer = profiles.computeIfAbsent(key,
-                k -> new ArrayDeque<>());
+        Deque<Entry> buffer = tab(key).interactions;
         if (buffer.size() == capacity) {
             entriesById.remove(buffer.removeFirst().id);
         }
@@ -290,15 +298,70 @@ public class ProfileStore implements InteractionSink {
     }
 
     synchronized List<ProfiledInteraction> profile(UiKey key) {
-        Deque<Entry> buffer = profiles.get(key);
-        if (buffer == null) {
+        Profile profile = profiles.get(key);
+        if (profile == null) {
             return List.of();
         }
         // An interaction still being handled is left out: what a profile
         // reports is what was captured, and that is only known once the
         // invocation has ended.
-        return buffer.reversed().stream().filter(Entry::isComplete)
-                .map(Entry::toProfiledInteraction).toList();
+        return profile.interactions.reversed().stream()
+                .filter(Entry::isComplete).map(Entry::toProfiledInteraction)
+                .toList();
+    }
+
+    /**
+     * Records how much server-side state one browser tab holds, replacing that
+     * tab's previous measurement — the question "how much memory is my view
+     * holding" is about the tab as it is now, not about each click it took to
+     * get there.
+     * <p>
+     * The measurement is handed in rather than made here: it is the sample the
+     * UI-state instrumentation already takes under the UI's own session lock,
+     * at UI init, after each navigation and when an interaction ends. Nothing
+     * walks a tree on this store's account, so a tab is measured no more often
+     * for being profiled. In development mode that instrumentation runs for
+     * this store even when the {@code ui-state} gauges are off, so the panel
+     * has a figure to show out of the box.
+     *
+     * @param ui
+     *            the tab that was measured, may be {@code null}
+     * @param sample
+     *            what the measurement found, may be {@code null}
+     */
+    public synchronized void uiStateSampled(UI ui, UiStateSample sample) {
+        if (ui == null || sample == null) {
+            return;
+        }
+        tab(key(ui)).state = sample;
+    }
+
+    /**
+     * The state one browser tab holds, as of the last time it was measured.
+     *
+     * @param ui
+     *            the tab to report on, may be {@code null}
+     * @return the tab's latest measurement, or {@code null} when it has none —
+     *         an unknown tab, or one whose UI-state instrumentation never ran
+     */
+    public UiStateSample uiState(UI ui) {
+        if (ui == null) {
+            return null;
+        }
+        return uiState(key(ui));
+    }
+
+    synchronized UiStateSample uiState(UiKey key) {
+        Profile profile = profiles.get(key);
+        return profile == null ? null : profile.state;
+    }
+
+    /**
+     * The profile of one tab, created on that tab's first record. Also marks
+     * the tab as recently used, which is what the UI limit evicts by.
+     */
+    private Profile tab(UiKey key) {
+        return profiles.computeIfAbsent(key, k -> new Profile());
     }
 
     /**
@@ -320,15 +383,29 @@ public class ProfileStore implements InteractionSink {
     }
 
     private synchronized void evict(UiKey key) {
-        Deque<Entry> buffer = profiles.remove(key);
-        if (buffer != null) {
-            forget(buffer);
+        Profile profile = profiles.remove(key);
+        if (profile != null) {
+            forget(profile.interactions);
         }
     }
 
     /** How many UI buffers are currently held. */
     synchronized int trackedUis() {
         return profiles.size();
+    }
+
+    /**
+     * What the store holds about one browser tab: the interactions it recorded
+     * and the state the tab was last measured to hold.
+     * <p>
+     * One object rather than two maps, so the two leave the store together —
+     * whichever of them the tab was evicted or closed on. Guarded by the
+     * store's monitor.
+     */
+    private static final class Profile {
+        private final Deque<Entry> interactions = new ArrayDeque<>();
+        /** Null until the UI-state instrumentation has measured the tab. */
+        private UiStateSample state;
     }
 
     /**

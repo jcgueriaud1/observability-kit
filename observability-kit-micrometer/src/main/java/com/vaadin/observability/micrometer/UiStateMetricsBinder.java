@@ -36,6 +36,7 @@ import com.vaadin.flow.server.VaadinServiceEventBus;
 import com.vaadin.flow.server.VaadinSession;
 import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
 import com.vaadin.flow.shared.Registration;
+import com.vaadin.observability.micrometer.insights.ProfileStore;
 
 /**
  * Publishes how much UI state the server is holding for live users, not just
@@ -75,6 +76,16 @@ import com.vaadin.flow.shared.Registration;
  * across all UIs — never one series per session or per UI, which would grow
  * unbounded with traffic. That is the same reason the kit keeps component-level
  * attribution off meter tags.
+ * <p>
+ * <strong>Two consumers, one walk.</strong> The per-UI figure the gauges
+ * deliberately do not carry is exactly what a developer profiling their own tab
+ * asks for, so each sample is also handed to the development-mode
+ * {@link ProfileStore}. The walk is what costs something here, so the two never
+ * schedule their own: in development mode this binder runs even when
+ * {@code ui-state} is off — {@link #bindGauges} is then never called and the
+ * store is the only reader — and when the setting is on, the profiler reads the
+ * samples the gauges were already taking. A production deployment with
+ * {@code ui-state} off has no store, so it runs no walks at all.
  * <p>
  * <strong>Serialization.</strong> This binder belongs to the service, not to
  * any one session: it tracks live state spanning every session, and its gauges
@@ -138,6 +149,13 @@ final class UiStateMetricsBinder
     private final long sampleIntervalNanos;
     private final int bytesPerNode;
     private final long totalsCacheNanos;
+    /**
+     * The development-mode profile store each sample is also handed to, or
+     * {@code null} in production mode. Transient for the reason the binder's
+     * own state is: this object is service-wide and has no business in a
+     * serialized session.
+     */
+    private final transient ProfileStore profiles;
     private transient Map<UI, Tracked> tracked = new ConcurrentHashMap<>();
 
     /**
@@ -152,9 +170,16 @@ final class UiStateMetricsBinder
     private transient volatile Totals cached;
     private transient volatile long cachedAtNanos;
 
-    UiStateMetricsBinder(MeterRegistry registry,
-            ObservabilitySettings settings) {
-        this(registry, settings, TOTALS_CACHE_NANOS);
+    /**
+     * @param settings
+     *            instrumentation settings, not {@code null}
+     * @param profiles
+     *            the development-mode profile store to hand each sample to, or
+     *            {@code null} in production mode
+     */
+    UiStateMetricsBinder(ObservabilitySettings settings,
+            ProfileStore profiles) {
+        this(settings, profiles, TOTALS_CACHE_NANOS);
     }
 
     /**
@@ -162,13 +187,28 @@ final class UiStateMetricsBinder
      *            how long an aggregate is reused; {@code 0} in tests, so a
      *            gauge read right after a measurement sees it
      */
-    UiStateMetricsBinder(MeterRegistry registry, ObservabilitySettings settings,
+    UiStateMetricsBinder(ObservabilitySettings settings, ProfileStore profiles,
             long totalsCacheNanos) {
         this.sampleIntervalNanos = TimeUnit.MILLISECONDS
                 .toNanos(settings.getUiStateSampleInterval());
         this.bytesPerNode = settings.getUiStateBytesPerNode();
         this.totalsCacheNanos = totalsCacheNanos;
+        this.profiles = profiles;
+    }
 
+    /**
+     * Publishes the aggregates of what the tracked UIs hold.
+     * <p>
+     * Separate from construction because the measurement has a second consumer
+     * that is not the meters: in development mode the binder samples for the
+     * {@link ProfileStore} whether or not {@code ui-state} is on, and only the
+     * setting being on binds these gauges. Called once, from
+     * {@code MetricsServiceInitListener}.
+     *
+     * @param registry
+     *            the registry to publish to, not {@code null}
+     */
+    void bindGauges(MeterRegistry registry) {
         // No base unit on the count gauges: Micrometer's Prometheus convention
         // appends it to the meter name, which would export
         // vaadin.ui.state.nodes as vaadin_ui_state_nodes_nodes.
@@ -298,7 +338,14 @@ final class UiStateMetricsBinder
             if (session == null) {
                 return;
             }
-            tracked.put(ui, new Tracked(session, UiStateSampler.sample(ui)));
+            UiStateSample sample = UiStateSampler.sample(ui);
+            tracked.put(ui, new Tracked(session, sample));
+            if (profiles != null) {
+                // The store keeps the tab's latest measurement, so the
+                // dev-tools panel can report what one view holds — the figure
+                // the aggregates above cannot carry.
+                profiles.uiStateSampled(ui, sample);
+            }
         } catch (RuntimeException e) {
             LOGGER.debug(
                     "Could not measure the state tree of UI {}, "

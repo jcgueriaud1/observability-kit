@@ -33,9 +33,11 @@ import com.vaadin.flow.server.UIInitEvent;
 import com.vaadin.flow.server.VaadinService;
 import com.vaadin.flow.server.VaadinSession;
 import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
+import com.vaadin.observability.micrometer.insights.ProfileStore;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -92,6 +94,7 @@ class UiStateMetricsBinderTest {
     }
 
     private SimpleMeterRegistry registry;
+    private ProfileStore profiles;
     private UiStateMetricsBinder binder;
 
     @BeforeEach
@@ -117,8 +120,20 @@ class UiStateMetricsBinderTest {
     private void useBinder(ObservabilitySettings.Builder builder,
             long totalsCacheNanos) {
         registry = new SimpleMeterRegistry();
-        binder = new UiStateMetricsBinder(registry, builder.build(),
+        profiles = new ProfileStore(ObservabilitySettings.builder().build());
+        binder = new UiStateMetricsBinder(builder.build(), profiles,
                 totalsCacheNanos);
+        binder.bindGauges(registry);
+    }
+
+    /**
+     * A session the store can key a tab by: it keys by the session id an
+     * interaction of that tab carries, which is the wrapped session's.
+     */
+    private static VaadinSession sessionWithId(String id) {
+        VaadinSession session = mock(VaadinSession.class, RETURNS_DEEP_STUBS);
+        when(session.getSession().getId()).thenReturn(id);
+        return session;
     }
 
     /**
@@ -135,11 +150,16 @@ class UiStateMetricsBinderTest {
     }
 
     private static Tab tab(VaadinSession session) {
+        return tab(session, 0);
+    }
+
+    private static Tab tab(VaadinSession session, int uiId) {
         UI real = new UI();
         UI ui = mock(UI.class);
         when(ui.getElement()).thenReturn(real.getElement());
         when(ui.getInternals()).thenReturn(real.getInternals());
         when(ui.getSession()).thenReturn(session);
+        when(ui.getUIId()).thenReturn(uiId);
         return new Tab(ui, real);
     }
 
@@ -455,6 +475,109 @@ class UiStateMetricsBinderTest {
 
         assertEquals(before, gauge(MeterNames.UI_STATE_NODES), 0.0,
                 "a measurement mid-scrape should not re-fold the map");
+    }
+
+    @Test
+    void theProfileStoreGetsTheSampleOfTheTabItWasTakenOn() {
+        // The gauges publish aggregates, so the per-UI figure a developer
+        // profiling their own tab asks for only exists if the sample itself is
+        // handed over.
+        Tab tab = tab(sessionWithId("session-a"));
+        tab.navigateTo(new TestLayout());
+        tab.grow(5);
+
+        binder.uiInit(new UIInitEvent(tab.ui(), mock(VaadinService.class)));
+
+        UiStateSample sample = profiles.uiState(tab.ui());
+        assertNotNull(sample, "the tab the sample was taken on should have it");
+        assertTrue(sample.nodes() >= 7,
+                "the whole tree should be in the sample, got "
+                        + sample.nodes());
+        assertEquals(1, sample.views(),
+                "the view the tab is showing is what the developer asked about");
+        assertEquals(0, sample.staleViews());
+    }
+
+    @Test
+    void theStoredSampleIsTheLatestOne() {
+        Tab tab = openTab(sessionWithId("session-a"));
+        int atInit = profiles.uiState(tab.ui()).nodes();
+
+        tab.grow(10);
+        resample(tab);
+
+        assertEquals(atInit + 10, profiles.uiState(tab.ui()).nodes(),
+                "a profiler reports what the tab holds now, not at init");
+    }
+
+    @Test
+    void navigationUpdatesTheStoredSample() {
+        // The measurement a view profiler is read for: what the view the
+        // developer just navigated to holds.
+        Tab tab = openTab(sessionWithId("session-a"));
+        tab.navigateTo(new TestLayout());
+        tab.grow(30);
+
+        ArgumentCaptor<AfterNavigationListener> captor = ArgumentCaptor
+                .forClass(AfterNavigationListener.class);
+        verify(tab.ui()).addAfterNavigationListener(captor.capture());
+        captor.getValue().afterNavigation(mock(AfterNavigationEvent.class));
+
+        UiStateSample sample = profiles.uiState(tab.ui());
+        assertTrue(sample.nodes() >= 31,
+                "the view just navigated to should be measured, got "
+                        + sample.nodes());
+        assertEquals(1, sample.views());
+    }
+
+    @Test
+    void eachTabIsStoredUnderItself() {
+        // A developer with the application open twice gets the tab they are
+        // looking at, not the other one.
+        VaadinSession session = sessionWithId("session-a");
+        Tab first = openTab(session);
+        Tab second = tab(session, 1);
+        second.grow(40);
+        binder.uiInit(new UIInitEvent(second.ui(), mock(VaadinService.class)));
+
+        assertTrue(
+                profiles.uiState(second.ui()).nodes() > profiles
+                        .uiState(first.ui()).nodes(),
+                "the heavy tab's sample must not be the quiet tab's");
+    }
+
+    @Test
+    void theStoreIsFedEvenWithoutTheGauges() {
+        // Development mode: the profiler works out of the box, while the
+        // production gauges stay opt-in. No registry is bound at all here.
+        registry = new SimpleMeterRegistry();
+        profiles = new ProfileStore(ObservabilitySettings.builder().build());
+        binder = new UiStateMetricsBinder(
+                ObservabilitySettings.builder().uiState(false).build(),
+                profiles);
+        Tab tab = tab(sessionWithId("session-a"));
+
+        binder.uiInit(new UIInitEvent(tab.ui(), mock(VaadinService.class)));
+
+        assertNotNull(profiles.uiState(tab.ui()),
+                "the store should be measured for whether ui-state is on or not");
+        assertNull(registry.find(MeterNames.UI_STATE_NODES).gauge(),
+                "and no aggregate should be published without the setting");
+    }
+
+    @Test
+    void withoutAStoreThereIsNothingToHandTheSampleTo() {
+        // The production shape: gauges only, and a sample that goes nowhere
+        // else must not be a failed measurement.
+        binder = new UiStateMetricsBinder(ObservabilitySettings.builder()
+                .uiState(true).uiStateSampleInterval(0).build(), null, 0);
+        binder.bindGauges(new SimpleMeterRegistry());
+        Tab tab = tab(sessionWithId("session-a"));
+
+        assertDoesNotThrow(() -> binder
+                .uiInit(new UIInitEvent(tab.ui(), mock(VaadinService.class))));
+
+        assertEquals(1, binder.trackedUis());
     }
 
     /** Fires the end of an RPC invocation on the given tab. */
