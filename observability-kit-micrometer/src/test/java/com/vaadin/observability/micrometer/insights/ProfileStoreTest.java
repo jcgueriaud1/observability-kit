@@ -9,6 +9,7 @@
 package com.vaadin.observability.micrometer.insights;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -25,6 +26,7 @@ import com.vaadin.flow.component.UI;
 import com.vaadin.flow.router.Location;
 import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
 import com.vaadin.flow.server.communication.RpcInvocationStartedEvent;
+import com.vaadin.flow.shared.Registration;
 import com.vaadin.observability.micrometer.ObservabilitySettings;
 import com.vaadin.observability.micrometer.UiStateSample;
 import com.vaadin.observability.micrometer.VaadinTelemetryContext;
@@ -74,6 +76,27 @@ class ProfileStoreTest {
         Mockito.when(ui.getInternals().getActiveViewLocation())
                 .thenReturn(new Location("orders/17"));
         return ui;
+    }
+
+    /** A panel watching one tab, keeping what it was told. */
+    private static final class Watcher implements ProfileListener {
+        private final List<ProfiledInteraction> interactions = new ArrayList<>();
+        private final List<UiStateSample> states = new ArrayList<>();
+
+        @Override
+        public void interactionRecorded(ProfiledInteraction interaction) {
+            interactions.add(interaction);
+        }
+
+        @Override
+        public void uiStateSampled(UiStateSample sample) {
+            states.add(sample);
+        }
+
+        List<String> events() {
+            return interactions.stream().map(ProfiledInteraction::interaction)
+                    .map(CapturedInteraction::event).toList();
+        }
     }
 
     /** Fires the detach the closing of a tab would fire. */
@@ -570,6 +593,189 @@ class ProfileStoreTest {
         Assertions.assertEquals(MAX_UIS, store.trackedUis(),
                 "a tab that is only measured still counts against the limit");
         Assertions.assertNull(store.uiState(evicted));
+    }
+
+    @Test
+    void aWatcherIsToldAsEachInteractionOfItsTabCompletes() {
+        // What makes the panel push-driven: the developer clicks and the row
+        // is there, rather than there on the next poll.
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+
+        store.add(interaction("session-a", 0, "click"));
+        store.add(interaction("session-a", 0, "keydown"));
+
+        Assertions.assertEquals(List.of("click", "keydown"), watcher.events(),
+                "in the order they happened, unlike a profile");
+    }
+
+    @Test
+    void aPushedInteractionCarriesTheQueriesItRan() {
+        // The panel draws a waterfall from the message it is pushed, so the
+        // children have to be on it — an interaction is complete when it is
+        // announced, and nothing goes back to the store for the rest.
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+
+        addQuery(begin(ui), "select * from orders where id=?", 1);
+        store.add(interaction("session-a", 0, "click"));
+
+        Assertions.assertEquals(List.of("select * from orders where id=?"),
+                watcher.interactions.get(0).queries().stream()
+                        .map(ProfiledQuery::statement).toList());
+    }
+
+    @Test
+    void aWatcherHearsAboutNoOtherTab() {
+        // A subscription is to one tab: the panel of one tab must not be told
+        // what the tab beside it — or another user's — is doing.
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+
+        store.add(interaction("session-a", 1, "click"));
+        store.add(interaction("session-b", 0, "click"));
+        store.uiStateSampled(tab("session-a", 1), state(4000));
+
+        Assertions.assertEquals(List.of(), watcher.events());
+        Assertions.assertEquals(List.of(), watcher.states);
+    }
+
+    @Test
+    void aWatcherIsToldWhenItsTabIsMeasured() {
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+
+        store.uiStateSampled(ui, state(4000));
+
+        Assertions.assertEquals(List.of(4000),
+                watcher.states.stream().map(UiStateSample::nodes).toList());
+    }
+
+    @Test
+    void removingTheHandleStopsTheMessages() {
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        Registration registration = store.listen(ui, watcher);
+
+        registration.remove();
+        store.add(interaction("session-a", 0, "click"));
+        store.uiStateSampled(ui, state(4000));
+
+        Assertions.assertEquals(List.of(), watcher.events());
+        Assertions.assertEquals(List.of(), watcher.states);
+    }
+
+    @Test
+    void closingATabDropsWhoeverWasWatchingIt() {
+        // A panel does not have to unsubscribe from a tab that is gone: the
+        // subscription ends with the shorter-lived of the two.
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.track(ui);
+        store.listen(ui, watcher);
+
+        close(ui);
+        store.add(interaction("session-a", 0, "click"));
+
+        Assertions.assertEquals(List.of(), watcher.events());
+    }
+
+    @Test
+    void aWatcherThatFailsCostsNothingButItsOwnMessage() {
+        // Told on the request thread of the interaction it is about: a panel
+        // whose connection is on its way out must not fail the click.
+        UI ui = tab("session-a", 0);
+        Watcher second = new Watcher();
+        store.listen(ui, new ProfileListener() {
+            @Override
+            public void interactionRecorded(ProfiledInteraction interaction) {
+                throw new IllegalStateException("the connection is closed");
+            }
+
+            @Override
+            public void uiStateSampled(UiStateSample sample) {
+                throw new IllegalStateException("the connection is closed");
+            }
+        });
+        store.listen(ui, second);
+
+        Assertions.assertDoesNotThrow(() -> {
+            store.add(interaction("session-a", 0, "click"));
+            store.uiStateSampled(ui, state(4000));
+        });
+
+        Assertions.assertEquals(List.of("click"), second.events(),
+                "the other watcher is told all the same");
+        Assertions.assertEquals(List.of("click"), events(store.profile(ui)),
+                "and the interaction is kept");
+    }
+
+    @Test
+    void watchingNothingIsNotAFailure() {
+        Assertions.assertDoesNotThrow(() -> {
+            store.listen(null, new Watcher()).remove();
+            store.listen(tab("session-a", 0), null).remove();
+        });
+    }
+
+    @Test
+    void clearingATabForgetsWhatItDid() {
+        // The panel's Clear button: the developer has read what is there and
+        // wants the next click to arrive on an empty list — including after a
+        // reload, which loads the profile again.
+        UI ui = tab("session-a", 0);
+        store.add(interaction("session-a", 0, "click"));
+
+        store.clear(ui);
+
+        Assertions.assertTrue(store.profile(ui).isEmpty());
+        store.add(interaction("session-a", 0, "keydown"));
+        Assertions.assertEquals(List.of("keydown"), events(store.profile(ui)),
+                "and the tab goes on being profiled");
+    }
+
+    @Test
+    void clearingATabKeepsTheStateItHolds() {
+        // State is what the tab holds now, not something it did; clearing the
+        // list of interactions is not a reason for the panel's footer to go
+        // blank until the next measurement.
+        UI ui = tab("session-a", 0);
+        store.uiStateSampled(ui, state(4000));
+
+        store.clear(ui);
+
+        Assertions.assertEquals(4000, store.uiState(ui).nodes());
+    }
+
+    @Test
+    void clearingKeepsTheInteractionStillBeingHandled() {
+        // Clear arrives on the dev-tools connection, which is not the thread
+        // handling the click: one in flight has to survive it, or the queries
+        // it has already run are lost and its record never completes.
+        UI ui = tab("session-a", 0);
+        long inFlight = begin(ui);
+
+        store.clear(ui);
+        addQuery(inFlight, "select * from orders", 12);
+        store.add(interaction("session-a", 0, "click"));
+
+        List<ProfiledInteraction> profile = store.profile(ui);
+        Assertions.assertEquals(List.of("click"), events(profile));
+        Assertions.assertEquals(1, profile.get(0).queries().size(),
+                "with the queries it had already run");
+    }
+
+    @Test
+    void clearingATabNobodyHasProfiledIsNotAFailure() {
+        Assertions.assertDoesNotThrow(() -> {
+            store.clear(tab("session-a", 0));
+            store.clear(null);
+        });
+        Assertions.assertEquals(0, store.trackedUis());
     }
 
     @Test

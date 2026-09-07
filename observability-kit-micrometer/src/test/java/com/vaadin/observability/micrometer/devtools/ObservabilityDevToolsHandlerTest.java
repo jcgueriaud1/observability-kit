@@ -9,7 +9,7 @@
 package com.vaadin.observability.micrometer.devtools;
 
 import java.time.Instant;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -49,21 +49,30 @@ class ObservabilityDevToolsHandlerTest {
     private static final int OTHER_UI_ID = 1;
     private static final String ROUTE = "orders/:orderId";
 
-    /** Records what the handler sent, per command. */
+    /**
+     * One dev-tools connection, recording what the handler sent it. Messages
+     * are kept in order and not only per command, since a subscribed panel is
+     * sent the same command over and over.
+     */
     private static final class Sent implements DevToolsInterface {
-        private final Map<String, Object> messages = new HashMap<>();
+        private final List<Map.Entry<String, Object>> messages = new ArrayList<>();
 
         @Override
         public void send(String command, Object data) {
-            messages.put(command, data);
+            messages.add(Map.entry(command, data));
         }
 
         @SuppressWarnings("unchecked")
+        List<Map<String, Object>> payloads(String command) {
+            return messages.stream().filter(m -> m.getKey().equals(command))
+                    .map(m -> (Map<String, Object>) m.getValue()).toList();
+        }
+
         Map<String, Object> payload(String command) {
-            Object data = messages.get(command);
-            Assertions.assertNotNull(data,
+            List<Map<String, Object>> sent = payloads(command);
+            Assertions.assertFalse(sent.isEmpty(),
                     "no " + command + " message was sent");
-            return (Map<String, Object>) data;
+            return sent.get(sent.size() - 1);
         }
     }
 
@@ -76,18 +85,24 @@ class ObservabilityDevToolsHandlerTest {
     private final ObservabilityDevToolsHandler handler = new ObservabilityDevToolsHandler(
             () -> registry, () -> profiles, () -> session);
 
-    /**
-     * A tab of the developer's own session, reachable by its UI id the way the
-     * handler resolves it. The lock is reported as held, which is the path a
-     * handler called from a thread that already has the session takes.
-     */
-    private UI ownTab(String sessionId, int uiId) {
+    /** A tab, as the store keys the interactions it records for it. */
+    private static UI tab(String sessionId, int uiId) {
         UI ui = Mockito.mock(UI.class, Mockito.RETURNS_DEEP_STUBS);
         Mockito.when(ui.getUIId()).thenReturn(uiId);
         Mockito.when(ui.getSession().getSession().getId())
                 .thenReturn(sessionId);
         Mockito.when(ui.getInternals().getActiveViewLocation())
                 .thenReturn(new Location("orders/17"));
+        return ui;
+    }
+
+    /**
+     * A tab of the developer's own session, reachable by its UI id the way the
+     * handler resolves it. The lock is reported as held, which is the path a
+     * handler called from a thread that already has the session takes.
+     */
+    private UI ownTab(String sessionId, int uiId) {
+        UI ui = tab(sessionId, uiId);
         Mockito.when(session.hasLock()).thenReturn(true);
         Mockito.when(session.getUIById(uiId)).thenReturn(ui);
         return ui;
@@ -120,6 +135,32 @@ class ObservabilityDevToolsHandlerTest {
 
     private List<Object> events() {
         return interactions().stream().map(i -> i.get("event")).toList();
+    }
+
+    private void subscribe(Sent connection, int uiId) {
+        Assertions.assertTrue(handler.handleMessage(
+                ObservabilityDevToolsHandler.COMMAND_PROFILE_SUBSCRIBE,
+                data().put("uiId", uiId), connection));
+    }
+
+    private void clear(int uiId) {
+        Assertions.assertTrue(handler.handleMessage(
+                ObservabilityDevToolsHandler.COMMAND_PROFILE_CLEAR,
+                data().put("uiId", uiId), sent));
+    }
+
+    /** The interactions pushed to a connection, in the order they arrived. */
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> pushed(Sent connection) {
+        return connection
+                .payloads(ObservabilityDevToolsHandler.COMMAND_INTERACTION)
+                .stream().map(message -> (Map<String, Object>) message
+                        .get("interaction"))
+                .toList();
+    }
+
+    private static List<Object> pushedEvents(Sent connection) {
+        return pushed(connection).stream().map(i -> i.get("event")).toList();
     }
 
     private void routeSummary(String route) {
@@ -468,5 +509,182 @@ class ObservabilityDevToolsHandlerTest {
         profile(UI_ID);
 
         Assertions.assertEquals(List.of(), interactions());
+    }
+
+    @Test
+    void aSubscribedPanelIsSentEachInteractionAsItFinishes() {
+        // What makes the panel push-driven: the developer clicks and the row
+        // is there, rather than there on the next poll.
+        UI ui = ownTab(SESSION, UI_ID);
+        subscribe(sent, UI_ID);
+
+        profiles.begin(ui);
+        profiles.addQuery(VaadinTelemetryContext.interactionId(ui),
+                ProfiledQuery.KIND_JDBC, "select * from orders where id=?", 1,
+                8, System.nanoTime());
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.add(interaction(SESSION, UI_ID, "keydown"));
+
+        Assertions.assertEquals(List.of("click", "keydown"),
+                pushedEvents(sent));
+        Map<String, Object> message = sent
+                .payloads(ObservabilityDevToolsHandler.COMMAND_INTERACTION)
+                .get(0);
+        Assertions.assertEquals(UI_ID, message.get("uiId"),
+                "the message says which tab it is about");
+        Assertions.assertNotNull(message.get("timestamp"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> queries = (List<Map<String, Object>>) pushed(
+                sent).get(0).get("queries");
+        Assertions.assertEquals("select * from orders where id=?",
+                queries.get(0).get("sql"),
+                "the panel draws its waterfall from what it was pushed");
+    }
+
+    @Test
+    void aPushedInteractionIsShapedLikeOneInTheProfile() {
+        // The panel renders a row the same way whether it was loaded or
+        // pushed, so the two must not drift apart.
+        ownTab(SESSION, UI_ID);
+        subscribe(sent, UI_ID);
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+
+        profile(UI_ID);
+
+        Assertions.assertEquals(interactions().get(0), pushed(sent).get(0));
+    }
+
+    @Test
+    void aSubscribedPanelIsSentEachStateSample() {
+        UI ui = ownTab(SESSION, UI_ID);
+        subscribe(sent, UI_ID);
+
+        profiles.uiStateSampled(ui, new UiStateSample(812, 210, 2, 0,
+                System.nanoTime() - TimeUnit.SECONDS.toNanos(1)));
+
+        Map<String, Object> message = sent
+                .payload(ObservabilityDevToolsHandler.COMMAND_UI_STATE);
+        Assertions.assertEquals(UI_ID, message.get("uiId"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> state = (Map<String, Object>) message
+                .get("uiState");
+        Assertions.assertEquals(812, state.get("nodes"));
+        Assertions.assertTrue((long) state.get("sampleAgeMs") >= 1000,
+                "and reaches the panel as an age, like in a profile");
+    }
+
+    @Test
+    void aUiOfAnotherSessionCannotBeSubscribedTo() {
+        // The scope rule of the profile, on the subscription: a dev-tools
+        // connection must not be pushed another user's tab either.
+        ownTab(SESSION, UI_ID);
+
+        subscribe(sent, OTHER_UI_ID);
+        profiles.add(interaction(OTHER_SESSION, OTHER_UI_ID, "click"));
+
+        Assertions.assertEquals(List.of(), pushed(sent));
+    }
+
+    @Test
+    void eachPanelIsSentItsOwnTabOnly() {
+        // Two tabs of the developer's own session, each with its panel open.
+        ownTab(SESSION, UI_ID);
+        ownTab(SESSION, OTHER_UI_ID);
+        Sent otherPanel = new Sent();
+        subscribe(sent, UI_ID);
+        subscribe(otherPanel, OTHER_UI_ID);
+
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.add(interaction(SESSION, OTHER_UI_ID, "scroll"));
+
+        Assertions.assertEquals(List.of("click"), pushedEvents(sent));
+        Assertions.assertEquals(List.of("scroll"), pushedEvents(otherPanel));
+    }
+
+    @Test
+    void subscribingAgainDoesNotDoubleTheMessages() {
+        // A panel that reloads, or reconnects, subscribes again; the developer
+        // must not then see every click twice.
+        ownTab(SESSION, UI_ID);
+        subscribe(sent, UI_ID);
+        subscribe(sent, UI_ID);
+
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+
+        Assertions.assertEquals(List.of("click"), pushedEvents(sent));
+    }
+
+    @Test
+    void aClosedPanelIsNotSentAnythingMore() {
+        ownTab(SESSION, UI_ID);
+        subscribe(sent, UI_ID);
+
+        handler.handleDisconnect(sent);
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+
+        Assertions.assertEquals(List.of(), pushed(sent),
+                "the subscription goes with the connection");
+    }
+
+    @Test
+    void closingOnePanelLeavesTheOtherSubscribed() {
+        ownTab(SESSION, UI_ID);
+        Sent otherPanel = new Sent();
+        subscribe(sent, UI_ID);
+        subscribe(otherPanel, UI_ID);
+
+        handler.handleDisconnect(sent);
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+
+        Assertions.assertEquals(List.of(), pushed(sent));
+        Assertions.assertEquals(List.of("click"), pushedEvents(otherPanel));
+    }
+
+    @Test
+    void clearingEmptiesThatTabsBuffer() {
+        // The panel clears its own list; this is what keeps the next load from
+        // bringing the cleared interactions back.
+        UI ui = ownTab(SESSION, UI_ID);
+        profiles.uiStateSampled(ui,
+                new UiStateSample(812, 210, 2, 0, System.nanoTime()));
+        profiles.add(interaction(SESSION, UI_ID, "click"));
+
+        clear(UI_ID);
+        profile(UI_ID);
+
+        Assertions.assertEquals(List.of(), interactions());
+        Assertions.assertNotNull(
+                sent.payload(ObservabilityDevToolsHandler.COMMAND_PROFILE_DATA)
+                        .get("uiState"),
+                "what the tab holds now is not something it did");
+    }
+
+    @Test
+    void clearingCannotReachAnotherSessionsTab() {
+        ownTab(SESSION, UI_ID);
+        UI otherUsersTab = tab(OTHER_SESSION, OTHER_UI_ID);
+        profiles.add(interaction(OTHER_SESSION, OTHER_UI_ID, "click"));
+
+        clear(OTHER_UI_ID);
+
+        Assertions.assertEquals(List.of("click"),
+                profiles.profile(otherUsersTab).stream()
+                        .map(i -> i.interaction().event()).toList(),
+                "the other user's tab is not this connection's to clear");
+    }
+
+    @Test
+    void withNoProfileStoreSubscribingAndClearingAreNotFailures() {
+        ObservabilityDevToolsHandler noStore = new ObservabilityDevToolsHandler(
+                () -> registry, () -> null, () -> session);
+        ownTab(SESSION, UI_ID);
+
+        Assertions.assertTrue(noStore.handleMessage(
+                ObservabilityDevToolsHandler.COMMAND_PROFILE_SUBSCRIBE,
+                data().put("uiId", UI_ID), sent));
+        Assertions.assertTrue(noStore.handleMessage(
+                ObservabilityDevToolsHandler.COMMAND_PROFILE_CLEAR,
+                data().put("uiId", UI_ID), sent));
+        Assertions.assertDoesNotThrow(() -> noStore.handleDisconnect(sent));
     }
 }
