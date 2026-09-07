@@ -17,7 +17,11 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import org.slf4j.LoggerFactory;
 
 import com.vaadin.flow.component.ComponentEventListener;
 import com.vaadin.flow.component.DetachEvent;
@@ -59,6 +63,13 @@ import com.vaadin.observability.micrometer.VaadinTelemetryContext;
  * {@link #uiStateSampled measurement} of that UI. The store does not measure
  * anything itself: the walk is the one the UI-state instrumentation already
  * does under the session lock, handed over rather than repeated.
+ * <p>
+ * <strong>What it keeps, it also announces.</strong> A profiler is watched
+ * while it is used, so a {@link ProfileListener} can be {@link #listen
+ * registered} per UI and is told as each interaction of that tab completes and
+ * as the tab is measured again. The dev-tools panel subscribes that way rather
+ * than polling, and nothing else about the store changes: a store nobody
+ * listens to does exactly what it did before.
  * <p>
  * <strong>Only in development mode.</strong> The store is created by
  * {@code MetricsServiceInitListener} next to the dev-tools client injection and
@@ -120,6 +131,15 @@ public class ProfileStore implements InteractionSink {
      * profile that was evicted.
      */
     private final Map<Long, Entry> entriesById = new HashMap<>();
+
+    /**
+     * Who is watching each tab, guarded by {@code this} like everything else
+     * here. The lists themselves are copy-on-write so that a notification can
+     * iterate one after the monitor is released: a listener sends to a browser,
+     * and holding the store — which every interaction of every tab needs —
+     * across that is exactly what must not happen.
+     */
+    private final Map<UiKey, List<ProfileListener>> listeners = new HashMap<>();
 
     private long lastId;
 
@@ -195,14 +215,25 @@ public class ProfileStore implements InteractionSink {
      * without children.
      */
     @Override
-    public synchronized void add(CapturedInteraction interaction) {
+    public void add(CapturedInteraction interaction) {
         UiKey key = new UiKey(interaction.sessionId(), interaction.uiId());
-        Entry pending = pending(key);
-        if (pending == null) {
-            pending = new Entry(++lastId, System.nanoTime());
-            retain(key, pending);
+        ProfiledInteraction recorded;
+        List<ProfileListener> watching;
+        synchronized (this) {
+            Entry pending = pending(key);
+            if (pending == null) {
+                pending = new Entry(++lastId, System.nanoTime());
+                retain(key, pending);
+            }
+            pending.interaction = interaction;
+            watching = listeners.get(key);
+            // The immutable view is built here, where the entry may be read,
+            // and only when somebody is going to be handed it.
+            recorded = watching == null ? null
+                    : pending.toProfiledInteraction();
         }
-        pending.interaction = interaction;
+        notifyWatchers(watching,
+                listener -> listener.interactionRecorded(recorded));
     }
 
     /**
@@ -311,6 +342,33 @@ public class ProfileStore implements InteractionSink {
     }
 
     /**
+     * Forgets the interactions recorded for one browser tab, which is what the
+     * panel's Clear button asks for: the developer has read what is there and
+     * wants the next click to arrive on an empty list.
+     * <p>
+     * The interaction being handled right now keeps its place — a click that is
+     * in flight when Clear is pressed still arrives, with the queries it has
+     * already run — and so does the tab's state measurement, which describes
+     * what the tab holds now rather than anything it did.
+     *
+     * @param ui
+     *            the tab to clear, may be {@code null}
+     */
+    public synchronized void clear(UI ui) {
+        Profile profile = ui == null ? null : profiles.get(key(ui));
+        if (profile == null) {
+            return;
+        }
+        profile.interactions.removeIf(entry -> {
+            if (!entry.isComplete()) {
+                return false;
+            }
+            entriesById.remove(entry.id);
+            return true;
+        });
+    }
+
+    /**
      * Records how much server-side state one browser tab holds, replacing that
      * tab's previous measurement — the question "how much memory is my view
      * holding" is about the tab as it is now, not about each click it took to
@@ -329,11 +387,17 @@ public class ProfileStore implements InteractionSink {
      * @param sample
      *            what the measurement found, may be {@code null}
      */
-    public synchronized void uiStateSampled(UI ui, UiStateSample sample) {
+    public void uiStateSampled(UI ui, UiStateSample sample) {
         if (ui == null || sample == null) {
             return;
         }
-        tab(key(ui)).state = sample;
+        UiKey key = key(ui);
+        List<ProfileListener> watching;
+        synchronized (this) {
+            tab(key).state = sample;
+            watching = listeners.get(key);
+        }
+        notifyWatchers(watching, listener -> listener.uiStateSampled(sample));
     }
 
     /**
@@ -354,6 +418,67 @@ public class ProfileStore implements InteractionSink {
     synchronized UiStateSample uiState(UiKey key) {
         Profile profile = profiles.get(key);
         return profile == null ? null : profile.state;
+    }
+
+    /**
+     * Watches one browser tab, so that what the store records for it can be
+     * pushed to a dev-tools panel as it happens.
+     * <p>
+     * The listener is told on the thread that recorded — a request thread of
+     * the watched tab, holding its session lock — so it may build a message and
+     * hand it on, but must not wait. It is dropped when the returned handle is
+     * removed and when the UI detaches, whichever comes first; a panel
+     * therefore does not have to unsubscribe from a tab the developer closed.
+     *
+     * @param ui
+     *            the tab to watch, may be {@code null}
+     * @param listener
+     *            what to tell, may be {@code null}
+     * @return a handle removing the listener registered here, never
+     *         {@code null}
+     */
+    public Registration listen(UI ui, ProfileListener listener) {
+        if (ui == null || listener == null) {
+            return () -> {
+                // Nothing was registered, so nothing has to be removed.
+            };
+        }
+        UiKey key = key(ui);
+        synchronized (this) {
+            listeners.computeIfAbsent(key, k -> new CopyOnWriteArrayList<>())
+                    .add(listener);
+        }
+        return () -> unlisten(key, listener);
+    }
+
+    private synchronized void unlisten(UiKey key, ProfileListener listener) {
+        List<ProfileListener> watching = listeners.get(key);
+        if (watching != null && watching.remove(listener)
+                && watching.isEmpty()) {
+            listeners.remove(key);
+        }
+    }
+
+    /**
+     * Tells the watchers of one tab, with the store's monitor released and
+     * every listener kept from costing the interaction it is about: a panel
+     * that has gone away, or a connection that throws on the way out, must not
+     * fail the request that was only being reported on.
+     */
+    private static void notifyWatchers(List<ProfileListener> watching,
+            Consumer<ProfileListener> what) {
+        if (watching == null) {
+            return;
+        }
+        for (ProfileListener listener : watching) {
+            try {
+                what.accept(listener);
+            } catch (RuntimeException e) {
+                LoggerFactory.getLogger(ProfileStore.class).debug(
+                        "Could not tell a profile listener what was recorded",
+                        e);
+            }
+        }
     }
 
     /**
@@ -387,6 +512,10 @@ public class ProfileStore implements InteractionSink {
         if (profile != null) {
             forget(profile.interactions);
         }
+        // The tab is gone, so there is nothing left to tell anyone about it:
+        // a panel watching it is dropped here rather than left holding a
+        // subscription to a UI that will never record again.
+        listeners.remove(key);
     }
 
     /** How many UI buffers are currently held. */

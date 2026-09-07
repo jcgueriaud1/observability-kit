@@ -9,6 +9,7 @@
 package com.vaadin.observability.micrometer.devtools;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,10 +32,12 @@ import com.vaadin.base.devserver.DevToolsInterface;
 import com.vaadin.base.devserver.DevToolsMessageHandler;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.server.VaadinSession;
+import com.vaadin.flow.shared.Registration;
 import com.vaadin.observability.micrometer.MeterNames;
 import com.vaadin.observability.micrometer.ObservabilityKit;
 import com.vaadin.observability.micrometer.UiStateSample;
 import com.vaadin.observability.micrometer.insights.CapturedInteraction;
+import com.vaadin.observability.micrometer.insights.ProfileListener;
 import com.vaadin.observability.micrometer.insights.ProfileStore;
 import com.vaadin.observability.micrometer.insights.ProfiledInteraction;
 import com.vaadin.observability.micrometer.insights.ProfiledQuery;
@@ -52,8 +55,10 @@ import com.vaadin.observability.micrometer.insights.ProfiledQuery;
  *
  * <h2>The protocol</h2>
  * <p>
- * Three commands, each answered with one message. This is what the Copilot
- * panels code against, so treat the field names below as a contract.
+ * Five commands. Three are answered with one message, one subscribes to
+ * messages the server sends later of its own accord, and one only asks the
+ * server to forget. This is what the Copilot panels code against, so treat the
+ * command and field names below as a contract.
  *
  * <h3>{@code observability-kit-refresh} →
  * {@code observability-kit-metrics}</h3>
@@ -112,6 +117,44 @@ import com.vaadin.observability.micrometer.insights.ProfiledQuery;
  * found and the profile comes back empty. A dev-tools connection must not be
  * able to read another user's tab by guessing a small integer.
  *
+ * <h3>{@code observability-kit-profile-subscribe} → pushed
+ * {@code observability-kit-interaction} and
+ * {@code observability-kit-ui-state}</h3>
+ * <p>
+ * Request: {@code { "uiId": <int> }}, answered with nothing. From then on, each
+ * time that tab finishes an interaction the server sends
+ * 
+ * <pre>
+ * { "timestamp": 1767225600000, "uiId": 3, "interaction": { &lt;interaction&gt; } }
+ * </pre>
+ * 
+ * with {@code <interaction>} in exactly the shape the profile message uses, and
+ * each time the tab is measured again it sends
+ * 
+ * <pre>
+ * { "timestamp": 1767225600000, "uiId": 3, "uiState": { &lt;uiState&gt; } }
+ * </pre>
+ * 
+ * A panel therefore loads once with {@code observability-kit-profile} and is
+ * told about everything after that, rather than polling for a click that has
+ * usually not happened. The scope rule is the profile's: a {@code uiId} that is
+ * not this session's subscribes to nothing.
+ * <p>
+ * The subscription lasts as long as the shorter of the two things it connects —
+ * it is dropped when the dev-tools connection closes and when the UI detaches —
+ * so a closed panel or a closed tab leaves nothing behind. Subscribing twice
+ * for the same tab on one connection replaces the earlier subscription rather
+ * than doubling the messages.
+ *
+ * <h3>{@code observability-kit-profile-clear}</h3>
+ * <p>
+ * Request: {@code { "uiId": <int> }}, answered with nothing: the panel clears
+ * its own list, and this is what makes the server agree, so that a later
+ * {@code observability-kit-profile} does not bring the cleared interactions
+ * back. The tab's state measurement survives — it describes what the tab holds
+ * now, not what it did — and so does an interaction that is still being
+ * handled, which arrives on the subscription as usual.
+ *
  * <h3>{@code observability-kit-route-summary} →
  * {@code observability-kit-route-summary-data}</h3>
  * <p>
@@ -144,6 +187,13 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
     static final String COMMAND_PROFILE = "observability-kit-profile";
     static final String COMMAND_PROFILE_DATA = "observability-kit-profile-data";
 
+    static final String COMMAND_PROFILE_SUBSCRIBE = "observability-kit-profile-subscribe";
+    static final String COMMAND_PROFILE_CLEAR = "observability-kit-profile-clear";
+
+    /** Pushed to a subscribed panel, unasked. */
+    static final String COMMAND_INTERACTION = "observability-kit-interaction";
+    static final String COMMAND_UI_STATE = "observability-kit-ui-state";
+
     static final String COMMAND_ROUTE_SUMMARY = "observability-kit-route-summary";
     static final String COMMAND_ROUTE_SUMMARY_DATA = "observability-kit-route-summary-data";
 
@@ -164,6 +214,21 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
      * Vaadin route template there.
      */
     private static final String TAG_URI = "uri";
+
+    /**
+     * The tabs each open panel is watching, as the handles that stop watching
+     * them: one entry per dev-tools connection, one per subscribed UI id within
+     * it. Guarded by its own monitor — a panel opening or closing is rare, and
+     * everything here is short.
+     * <p>
+     * One handler instance serves every dev-tools connection of the service
+     * (Flow loads it once through the {@link java.util.ServiceLoader}), so the
+     * connection is part of the key rather than a field. It identifies a
+     * websocket by value, not by object identity: the {@code DevToolsInterface}
+     * handed to a message and the one handed to the disconnect are two
+     * instances describing the same connection.
+     */
+    private final Map<DevToolsInterface, Map<Integer, Registration>> subscriptions = new HashMap<>();
 
     private final Supplier<MeterRegistry> registry;
     private final Supplier<ProfileStore> profiles;
@@ -192,6 +257,23 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
         sendSnapshot(devToolsInterface);
     }
 
+    /**
+     * Stops watching whatever this connection was watching. A panel is closed
+     * by closing the browser tab it is in, which is also the end of the UI it
+     * was showing, so this and the store's own detach hook usually fire
+     * together; either one on its own is enough.
+     */
+    @Override
+    public void handleDisconnect(DevToolsInterface devToolsInterface) {
+        Map<Integer, Registration> watched;
+        synchronized (subscriptions) {
+            watched = subscriptions.remove(devToolsInterface);
+        }
+        if (watched != null) {
+            watched.values().forEach(Registration::remove);
+        }
+    }
+
     @Override
     public boolean handleMessage(String command, JsonNode data,
             DevToolsInterface devToolsInterface) {
@@ -201,6 +283,12 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
             return true;
         case COMMAND_PROFILE:
             sendProfile(devToolsInterface, intField(data, "uiId"));
+            return true;
+        case COMMAND_PROFILE_SUBSCRIBE:
+            subscribe(devToolsInterface, intField(data, "uiId"));
+            return true;
+        case COMMAND_PROFILE_CLEAR:
+            clear(intField(data, "uiId"));
             return true;
         case COMMAND_ROUTE_SUMMARY:
             sendRouteSummary(devToolsInterface, stringField(data, "route"));
@@ -241,6 +329,50 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
         }
         payload.put("interactions", list);
         devToolsInterface.send(COMMAND_PROFILE_DATA, payload);
+    }
+
+    /**
+     * Watches one tab of the developer's own session for this connection,
+     * pushing each interaction it finishes and each state sample it takes.
+     * <p>
+     * A tab that is not this session's, and a deployment with no store, are
+     * both a subscription to nothing rather than an error: the panel has
+     * already been told as much by the empty profile it loaded with.
+     */
+    private void subscribe(DevToolsInterface devToolsInterface, int uiId) {
+        UI ui = resolveOwnUi(uiId);
+        ProfileStore store = profiles.get();
+        if (ui == null || store == null) {
+            return;
+        }
+        Registration replaced;
+        // Registering while holding the monitor, so that a disconnect racing
+        // this cannot leave the store watching for a connection that is gone.
+        // The store's monitor is only ever taken after this one, never before.
+        synchronized (subscriptions) {
+            Registration watching = store.listen(ui,
+                    new PanelSubscription(devToolsInterface, uiId));
+            replaced = subscriptions
+                    .computeIfAbsent(devToolsInterface, c -> new HashMap<>())
+                    .put(uiId, watching);
+        }
+        // A panel that subscribes again — after a reload, or a reconnect —
+        // must not end up being told twice about the same interaction.
+        if (replaced != null) {
+            replaced.remove();
+        }
+    }
+
+    /**
+     * Empties one tab's buffer, so that what the panel just cleared does not
+     * come back on its next load.
+     */
+    private void clear(int uiId) {
+        UI ui = resolveOwnUi(uiId);
+        ProfileStore store = profiles.get();
+        if (ui != null && store != null) {
+            store.clear(ui);
+        }
     }
 
     /**
@@ -429,6 +561,39 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
         json.put("sampleAgeMs", Math.max(0, TimeUnit.NANOSECONDS
                 .toMillis(System.nanoTime() - sample.sampledAtNanos())));
         return json;
+    }
+
+    /**
+     * What a subscribed panel is told, as the store tells it.
+     * <p>
+     * Runs on a request thread of the watched tab, under its session lock, so
+     * it does the one thing it may do there: build the message and hand it to
+     * the dev-tools connection, which broadcasts it without waiting for the
+     * browser. Nothing here reads the store or the UI again — the interaction
+     * arrives complete — so the lock is held for a few maps and no longer.
+     */
+    private record PanelSubscription(DevToolsInterface connection,
+            int uiId) implements ProfileListener {
+
+        @Override
+        public void interactionRecorded(ProfiledInteraction interaction) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("timestamp", System.currentTimeMillis());
+            // Echoed like the answer to a profile request: one panel may be
+            // watching more than one tab of the session.
+            payload.put("uiId", uiId);
+            payload.put("interaction", interactionJson(interaction));
+            connection.send(COMMAND_INTERACTION, payload);
+        }
+
+        @Override
+        public void uiStateSampled(UiStateSample sample) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("timestamp", System.currentTimeMillis());
+            payload.put("uiId", uiId);
+            payload.put("uiState", uiState(sample));
+            connection.send(COMMAND_UI_STATE, payload);
+        }
     }
 
     private static int intField(JsonNode data, String field) {
