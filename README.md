@@ -366,6 +366,15 @@ there are.
 The gauges are aggregates only — totals and maxima, never one series per session
 or per UI, which would grow unbounded with traffic.
 
+In development mode the measurement also runs for the dev-tools view profiler,
+whether or not `ui-state` is on: "how much is this view holding" is a question
+about one tab, which is exactly what an aggregate cannot answer. Each UI's own
+latest measurement is then kept in memory for that developer's browser, no
+meter is registered unless the setting above is on, and the schedule below is
+unchanged — the profiler reads the samples that schedule already takes rather
+than walking a tree of its own. A production deployment with `ui-state` off
+measures nothing.
+
 **How measurement is scheduled.** A component tree may only be read under its
 own session lock, so no UI is ever measured by another user's request thread.
 Every UI measures itself: at UI init, after each navigation, and when an RPC

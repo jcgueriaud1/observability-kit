@@ -11,6 +11,11 @@ package com.vaadin.observability.micrometer;
 /**
  * What one UI's server-side state looked like at the moment it was measured by
  * {@link UiStateSampler}.
+ * <p>
+ * Public because it is what one UI holds, and that is the figure the dev-mode
+ * profiler shows for the developer's own tab: the meters publish aggregates
+ * only, so the per-UI measurement reaches the dev-tools panel through
+ * {@link com.vaadin.observability.micrometer.insights.ProfileStore} instead.
  *
  * @param nodes
  *            nodes in the UI's state tree: every node Flow retains to mirror
@@ -36,6 +41,6 @@ package com.vaadin.observability.micrometer;
  *            lock is held, so a sample of an idle user's UI is as old as their
  *            last interaction
  */
-record UiStateSample(int nodes, int components, int views, int staleViews,
-        long sampledAtNanos) {
+public record UiStateSample(int nodes, int components, int views,
+        int staleViews, long sampledAtNanos) {
 }
