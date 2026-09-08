@@ -8,6 +8,7 @@
  */
 package com.vaadin.observability.micrometer.insights;
 
+import java.io.Serial;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
@@ -15,6 +16,8 @@ import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import com.vaadin.flow.component.UI;
+import com.vaadin.flow.function.SerializableConsumer;
+import com.vaadin.flow.internal.ExecutionContext;
 import com.vaadin.flow.server.VaadinServiceEventBus;
 import com.vaadin.flow.server.communication.AbstractRpcInvocationEvent;
 import com.vaadin.flow.server.communication.RpcInvocationEndedEvent;
@@ -196,6 +199,9 @@ public class InteractionCollector {
         componentType.remove();
         boolean failed = errored.get();
         errored.remove();
+        // Arranged before the capture below, and for a failed invocation as
+        // well, since that one was captured at invocationFailed.
+        announceWhenTheRoundTripEnds(event.getUI());
         // Failed invocations are already captured with their duration; only
         // successful-but-slow ones are captured here.
         if (failed || !captureSlow || durationMs < uxBudgetMs) {
@@ -205,6 +211,34 @@ public class InteractionCollector {
             buffer.add(slowInteraction(event, durationMs, component));
         } catch (RuntimeException e) {
             // Best-effort, as above.
+        }
+    }
+
+    /**
+     * Arranges for what was captured of this invocation to reach the sink's
+     * readers once the round trip it belongs to is over, rather than here.
+     * <p>
+     * Here is too early for anything that loads data. A Grid or a ComboBox does
+     * not query while the invocation runs: it registers a flush, and Flow runs
+     * the flush — with every query it makes — as the response is written.
+     * Registering the announcement at this point puts it behind that flush,
+     * which was registered while the invocation ran, so the interaction goes
+     * out with the queries it actually cost.
+     * <p>
+     * Nothing is arranged for a UI nobody is watching, which is every UI of a
+     * production deployment and every tab whose panel is closed.
+     */
+    private void announceWhenTheRoundTripEnds(UI ui) {
+        if (ui == null || !buffer.isWatched(ui)) {
+            return;
+        }
+        try {
+            ui.beforeClientResponse(ui, new AnnounceRoundTrip(buffer));
+        } catch (RuntimeException e) {
+            // A UI that can no longer be scheduled on — one detached while its
+            // own invocation ran — is told now instead: an interaction without
+            // the queries that came after it beats one nobody hears about.
+            buffer.roundTripEnded(ui);
         }
     }
 
@@ -269,6 +303,41 @@ public class InteractionCollector {
     private static String location(UI ui) {
         return ui == null ? null
                 : ui.getInternals().getActiveViewLocation().getPath();
+    }
+
+    /**
+     * The end-of-round-trip announcement, as the Flow execution that carries
+     * it.
+     * <p>
+     * A class rather than a lambda so that its one reference can be
+     * {@code transient}, like {@code ProfileStore.EvictOnDetach}: an execution
+     * still pending when a session is serialized is written out with the state
+     * tree, and the sink — development-mode, service-wide state — has no
+     * business in that file. A restored stub announces nothing, which is the
+     * right answer, since the store it would have announced to did not survive
+     * either.
+     */
+    private static final class AnnounceRoundTrip
+            implements SerializableConsumer<ExecutionContext> {
+
+        @Serial
+        private static final long serialVersionUID = 1L;
+
+        private final transient InteractionSink sink;
+
+        AnnounceRoundTrip(InteractionSink sink) {
+            this.sink = sink;
+        }
+
+        @Override
+        public void accept(ExecutionContext context) {
+            if (sink == null) {
+                return;
+            }
+            // The UI comes from the context rather than from a field, so the
+            // execution holds nothing else across a serialization round trip.
+            sink.roundTripEnded(context.getUI());
+        }
     }
 
     private static Optional<String> firstApplicationFrame(

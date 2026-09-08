@@ -16,6 +16,12 @@
     Actuator Prometheus endpoint.
   </description>
 
+  <properties>
+    <!-- Platform version of the dev-mode/Copilot bundle; tracks flow.version's
+         platform release line. -->
+    <vaadin.dev.version>25.3-SNAPSHOT</vaadin.dev.version>
+  </properties>
+
   <dependencies>
     <!-- Boot starter under test — provides auto-config transitively -->
     <dependency>
@@ -36,6 +42,37 @@
       <groupId>com.vaadin</groupId>
       <artifactId>flow-html-components</artifactId>
       <version>${flow.version}</version>
+    </dependency>
+    <!--
+      Dev mode: Flow fails fast without the dev server, and the kit's Copilot
+      panels only exist in development mode. vaadin-dev is the platform
+      artifact that brings all three pieces the panel needs: vaadin-dev-server
+      (the DevToolsMessageHandler SPI), copilot (window.Vaadin.copilot, which
+      the panel registers itself with) and vaadin-dev-bundle. Optional so it
+      never reaches a production classpath.
+    -->
+    <dependency>
+      <groupId>com.vaadin</groupId>
+      <artifactId>vaadin-dev</artifactId>
+      <version>${vaadin.dev.version}</version>
+      <optional>true</optional>
+    </dependency>
+    <!--
+      Copilot asks the project what custom components it defines, and answers
+      that question by loading com.vaadin.flow.component.littemplate.LitTemplate
+      (CustomComponentInProject.litTemplate). This app's Flow classpath is
+      deliberately minimal - flow-server plus flow-html-components - where a
+      real application gets the class transitively from the vaadin platform
+      artifact, so without this the request dies with a NoClassDefFoundError on
+      the dev-tools websocket. The kit's own panels are unaffected, which is why
+      the trace is easy to mistake for harmless: it is Copilot's component-info
+      handler failing, on every activation, in a log a browser IT also reads.
+    -->
+    <dependency>
+      <groupId>com.vaadin</groupId>
+      <artifactId>flow-lit-template</artifactId>
+      <version>${flow.version}</version>
+      <optional>true</optional>
     </dependency>
 
     <!-- Spring Boot web (Tomcat) -->

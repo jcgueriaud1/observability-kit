@@ -8,6 +8,7 @@
  */
 package com.vaadin.observability.micrometer.insights;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -432,6 +433,100 @@ class InteractionCollectorTest {
                         + " characters");
         Assertions.assertTrue(message.endsWith("…"),
                 "truncation should be visible in the value");
+    }
+
+    /** A sink that only records the order in which it was called. */
+    private static final class Log implements InteractionSink {
+
+        private final List<String> calls = new ArrayList<>();
+        private final boolean watched;
+
+        Log() {
+            this(true);
+        }
+
+        Log(boolean watched) {
+            this.watched = watched;
+        }
+
+        @Override
+        public void add(CapturedInteraction interaction) {
+            calls.add("captured");
+        }
+
+        @Override
+        public void roundTripEnded(UI ui) {
+            calls.add("announced");
+        }
+
+        @Override
+        public boolean isWatched(UI ui) {
+            return watched;
+        }
+    }
+
+    @Test
+    void announcesOnlyOnceTheDataTheInvocationAskedForHasLoaded() {
+        // The bug this guards: a Grid or a ComboBox does not query while the
+        // invocation runs, it registers a flush that Flow runs as the response
+        // is written. An interaction announced at invocationEnded therefore
+        // reaches the panel before the queries it cost were recorded, with an
+        // empty waterfall — for exactly the interactions a profiler is opened
+        // to look at.
+        Log log = new Log();
+        InteractionCollector collector = InteractionCollector
+                .retainingEverything(log, settings(true, true));
+        Target target = target();
+
+        collector.invocationStarted(target.started());
+        // What a Grid asks for while the invocation runs: a flush, to be run
+        // when the response is written.
+        target.ui().beforeClientResponse(target.ui(),
+                context -> log.calls.add("loaded"));
+        collector.invocationEnded(target.ended());
+        target.ui().getInternals().getStateTree()
+                .runExecutionsBeforeClientResponse();
+
+        Assertions.assertEquals(List.of("captured", "loaded", "announced"),
+                log.calls,
+                "the announcement has to come after the load the invocation "
+                        + "asked for, or it carries none of its queries");
+    }
+
+    @Test
+    void arrangesNoAnnouncementForATabNobodyIsWatching() {
+        // Every UI of a production deployment, and every tab whose panel is
+        // closed: nothing is scheduled on the UI on the profiler's account.
+        Log log = new Log(false);
+        InteractionCollector collector = InteractionCollector
+                .retainingEverything(log, settings(true, true));
+        Target target = target();
+
+        collector.invocationStarted(target.started());
+        collector.invocationEnded(target.ended());
+        target.ui().getInternals().getStateTree()
+                .runExecutionsBeforeClientResponse();
+
+        Assertions.assertEquals(List.of("captured"), log.calls,
+                "captured as before, announced to nobody");
+    }
+
+    @Test
+    void aFailedInteractionIsAnnouncedToo() {
+        // It was captured at invocationFailed rather than at invocationEnded,
+        // so the arrangement must not sit behind the "was it slow" test.
+        Log log = new Log();
+        InteractionCollector collector = InteractionCollector
+                .retainingEverything(log, settings(true, true));
+        Target target = target();
+
+        collector.invocationStarted(target.started());
+        collector.invocationFailed(failedEvent(target, failure()));
+        collector.invocationEnded(target.ended());
+        target.ui().getInternals().getStateTree()
+                .runExecutionsBeforeClientResponse();
+
+        Assertions.assertEquals(List.of("captured", "announced"), log.calls);
     }
 
     @Test

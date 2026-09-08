@@ -162,6 +162,98 @@ The built-in server-side request timer is `vaadin.request.duration`, and
 server-side RPC invocations are timed as `vaadin.rpc.duration`. See
 [Metrics](#metrics) for the full list.
 
+## Development-mode panel
+
+In development mode the kit adds an **Observability** panel to Vaadin Copilot,
+with two tabs. Nothing in it exists in production: the panel is registered as a
+`developmentOnly` frontend module, so it is in no production bundle, and it
+reads over the dev-tools connection, which a production deployment does not
+have.
+
+### Interactions — what your click just cost
+
+The first tab is the developer's own tab, newest interaction first. Rows arrive
+as they happen: the panel subscribes to its tab once and the server sends each
+finished interaction, so a click shows up in the round trip that handled it
+rather than on the next poll. A Refresh button reloads the list and a Clear
+button empties it, on the client and on the server both.
+
+Opening a row shows what that interaction did.
+
+- **Headline figures** — the server time, the number of queries and the time in
+  the database, what the tab is holding, and, only when it failed, the outcome.
+  The database figure is called out once an interaction passes twenty queries.
+- **Timeline** — the request as one bar, then every query it ran, placed where
+  in the interaction it happened. Where the same statement ran repeatedly in a
+  row, the run is one hatched bar labelled with its count, so thirty lookups
+  read as one block of lookups rather than thirty slivers.
+- **Queries** — one row per distinct statement, with the executions counted.
+  A grid that looks up one row at a time shows `25 identical` rather than
+  twenty-five rows saying the same thing; opening that row lists the individual
+  executions with their offsets, which is how you tell a loop from a batch.
+  Clicking a statement lays it out clause by clause without rewriting it, and a
+  copy button hands over the original text.
+- **A hint**, when a rule fires: repeated statements name the frame a join
+  would go in, an interaction over the one-second budget names its slowest
+  query, and a failure shows the exception and where it was thrown. An
+  interaction inside the budget that ran one query breaks no rule and gets no
+  hint, so a hint appearing means something.
+- **The footer** says what the tab is holding right now — nodes, components,
+  views, stale views — and how long ago that was measured. A tab is measured on
+  its own session's thread, so an idle tab's figures are as old as its last
+  interaction.
+
+The list keeps the last hundred interactions per tab, matching
+`insights-capacity`, and a route chip narrows it to the view the tab is on.
+
+The profiler is scoped to the developer's own session. A tab is addressed by its
+UI id, and the server resolves that id only within the session the dev-tools
+connection belongs to, so an id from someone else's session finds nothing — a UI
+id is a small integer unique only within a session, and guessing one must not
+read another user's tab.
+
+What the profiler can show is what the kit captured. A successful interaction
+needs `requests`, a failed one needs `errors`, and both are on by default. SQL
+text is kept for the profiler regardless of `database-statement`, which governs
+what goes on an exported span; the statements stay in memory on the developer's
+own machine. UI state is measured for the profiler whether or not `ui-state` is
+on, since "how much is this view holding" is a question about one tab and the
+gauges are aggregates. See [UI state size](#ui-state-size) and [Database fetch
+size](#database-fetch-size).
+
+### Meters — what the application has done
+
+The second tab is every `vaadin.*` meter in the registry, with a sparkline of
+recent values, polled while that tab is the one open. That is the whole
+application — every user and every view — which is what a meter holds, and it
+is the panel the kit shipped before the profiler existed.
+
+### How it is shipped
+
+The panel is Lit and TypeScript in the kit's `META-INF/frontend`, registered
+with `@JsModule(developmentOnly = true)` and compiled by the application's own
+Vite build, so the kit needs no frontend build of its own.
+
+One consequence is worth knowing: a frontend module means the application's
+development bundle no longer matches Vaadin's prebuilt default one, so the
+first development-mode start after adding the kit builds a bundle (`npm install`
+and Vite). Applications that already define frontend code of their own were
+building one anyway.
+
+If that build fails on `Cannot find module '@vaadin/…'` in
+`frontend/generated/vaadin.ts`, the application's classpath is missing the
+Vaadin component set that Copilot's own UI is built from. That happens only on
+a Flow classpath without the platform — `flow-server` alone — where nothing
+declares those npm packages and the default bundle was hiding it. Declaring the
+package set is enough:
+
+```java
+@NpmPackage(value = "@vaadin/react-components", version = "<platform version>")
+```
+
+An application built on the `vaadin` or `vaadin-core` artifact already has
+them.
+
 ## Other setups
 
 ### Plain Spring (without Spring Boot)

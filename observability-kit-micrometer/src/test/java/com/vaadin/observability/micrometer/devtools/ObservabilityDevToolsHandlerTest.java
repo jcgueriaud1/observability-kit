@@ -523,7 +523,9 @@ class ObservabilityDevToolsHandlerTest {
                 ProfiledQuery.KIND_JDBC, "select * from orders where id=?", 1,
                 8, System.nanoTime());
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
         profiles.add(interaction(SESSION, UI_ID, "keydown"));
+        profiles.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of("click", "keydown"),
                 pushedEvents(sent));
@@ -545,9 +547,10 @@ class ObservabilityDevToolsHandlerTest {
     void aPushedInteractionIsShapedLikeOneInTheProfile() {
         // The panel renders a row the same way whether it was loaded or
         // pushed, so the two must not drift apart.
-        ownTab(SESSION, UI_ID);
+        UI ui = ownTab(SESSION, UI_ID);
         subscribe(sent, UI_ID);
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
 
         profile(UI_ID);
 
@@ -581,6 +584,7 @@ class ObservabilityDevToolsHandlerTest {
 
         subscribe(sent, OTHER_UI_ID);
         profiles.add(interaction(OTHER_SESSION, OTHER_UI_ID, "click"));
+        profiles.roundTripEnded(tab(OTHER_SESSION, OTHER_UI_ID));
 
         Assertions.assertEquals(List.of(), pushed(sent));
     }
@@ -588,14 +592,16 @@ class ObservabilityDevToolsHandlerTest {
     @Test
     void eachPanelIsSentItsOwnTabOnly() {
         // Two tabs of the developer's own session, each with its panel open.
-        ownTab(SESSION, UI_ID);
-        ownTab(SESSION, OTHER_UI_ID);
+        UI ui = ownTab(SESSION, UI_ID);
+        UI otherTab = ownTab(SESSION, OTHER_UI_ID);
         Sent otherPanel = new Sent();
         subscribe(sent, UI_ID);
         subscribe(otherPanel, OTHER_UI_ID);
 
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
         profiles.add(interaction(SESSION, OTHER_UI_ID, "scroll"));
+        profiles.roundTripEnded(otherTab);
 
         Assertions.assertEquals(List.of("click"), pushedEvents(sent));
         Assertions.assertEquals(List.of("scroll"), pushedEvents(otherPanel));
@@ -605,22 +611,24 @@ class ObservabilityDevToolsHandlerTest {
     void subscribingAgainDoesNotDoubleTheMessages() {
         // A panel that reloads, or reconnects, subscribes again; the developer
         // must not then see every click twice.
-        ownTab(SESSION, UI_ID);
+        UI ui = ownTab(SESSION, UI_ID);
         subscribe(sent, UI_ID);
         subscribe(sent, UI_ID);
 
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of("click"), pushedEvents(sent));
     }
 
     @Test
     void aClosedPanelIsNotSentAnythingMore() {
-        ownTab(SESSION, UI_ID);
+        UI ui = ownTab(SESSION, UI_ID);
         subscribe(sent, UI_ID);
 
         handler.handleDisconnect(sent);
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of(), pushed(sent),
                 "the subscription goes with the connection");
@@ -628,13 +636,14 @@ class ObservabilityDevToolsHandlerTest {
 
     @Test
     void closingOnePanelLeavesTheOtherSubscribed() {
-        ownTab(SESSION, UI_ID);
+        UI ui = ownTab(SESSION, UI_ID);
         Sent otherPanel = new Sent();
         subscribe(sent, UI_ID);
         subscribe(otherPanel, UI_ID);
 
         handler.handleDisconnect(sent);
         profiles.add(interaction(SESSION, UI_ID, "click"));
+        profiles.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of(), pushed(sent));
         Assertions.assertEquals(List.of("click"), pushedEvents(otherPanel));

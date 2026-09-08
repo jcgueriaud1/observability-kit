@@ -66,10 +66,18 @@ import com.vaadin.observability.micrometer.VaadinTelemetryContext;
  * <p>
  * <strong>What it keeps, it also announces.</strong> A profiler is watched
  * while it is used, so a {@link ProfileListener} can be {@link #listen
- * registered} per UI and is told as each interaction of that tab completes and
- * as the tab is measured again. The dev-tools panel subscribes that way rather
- * than polling, and nothing else about the store changes: a store nobody
- * listens to does exactly what it did before.
+ * registered} per UI and is told as each interaction of that tab is finished
+ * with and as the tab is measured again. The dev-tools panel subscribes that
+ * way rather than polling, and nothing else about the store changes: a store
+ * nobody listens to does exactly what it did before.
+ * <p>
+ * <strong>Finished with is later than captured.</strong> An interaction that
+ * loads data has not run its queries when its invocation ends: a Grid or a
+ * ComboBox registers a flush while the invocation runs and Flow runs it as the
+ * response is written. Watchers are therefore told at
+ * {@link #roundTripEnded(UI)} rather than at {@link #add(CapturedInteraction)}
+ * — otherwise the panel is pushed exactly the interactions a profiler exists
+ * for with an empty waterfall, while the store holds their queries.
  * <p>
  * <strong>Only in development mode.</strong> The store is created by
  * {@code MetricsServiceInitListener} next to the dev-tools client injection and
@@ -215,25 +223,84 @@ public class ProfileStore implements InteractionSink {
      * without children.
      */
     @Override
-    public void add(CapturedInteraction interaction) {
+    public synchronized void add(CapturedInteraction interaction) {
         UiKey key = new UiKey(interaction.sessionId(), interaction.uiId());
-        ProfiledInteraction recorded;
-        List<ProfileListener> watching;
-        synchronized (this) {
-            Entry pending = pending(key);
-            if (pending == null) {
-                pending = new Entry(++lastId, System.nanoTime());
-                retain(key, pending);
-            }
-            pending.interaction = interaction;
-            watching = listeners.get(key);
-            // The immutable view is built here, where the entry may be read,
-            // and only when somebody is going to be handed it.
-            recorded = watching == null ? null
-                    : pending.toProfiledInteraction();
+        Entry pending = pending(key);
+        if (pending == null) {
+            pending = new Entry(++lastId, System.nanoTime());
+            retain(key, pending);
         }
-        notifyWatchers(watching,
-                listener -> listener.interactionRecorded(recorded));
+        pending.interaction = interaction;
+    }
+
+    /**
+     * Announces to the watchers of this tab every interaction of it that has
+     * been completed and not yet announced.
+     * <p>
+     * This and not {@link #add(CapturedInteraction)} is where a watcher is
+     * told, because an interaction is not finished paying when its invocation
+     * ends: a Grid or a ComboBox only registers a flush while the invocation
+     * runs, and Flow runs that flush — with every query it makes — as the
+     * response is written. Announcing at capture time handed the panel each of
+     * those interactions with an empty waterfall, while the store itself held
+     * the queries all along.
+     * <p>
+     * Announcing here also means announcing at most once per interaction: the
+     * entry is marked as it goes out, so a second round trip of the same tab
+     * repeats nothing.
+     *
+     * @param ui
+     *            the tab whose round trip ended, may be {@code null}
+     */
+    @Override
+    public void roundTripEnded(UI ui) {
+        if (ui == null) {
+            return;
+        }
+        UiKey key = key(ui);
+        List<ProfileListener> watching;
+        List<ProfiledInteraction> announcing = new ArrayList<>();
+        synchronized (this) {
+            watching = listeners.get(key);
+            Profile profile = profiles.get(key);
+            if (profile == null) {
+                return;
+            }
+            for (Entry entry : profile.interactions) {
+                if (!entry.isComplete() || entry.announced) {
+                    continue;
+                }
+                entry.announced = true;
+                // The immutable view is built here, where the entry may be
+                // read, and only when somebody is going to be handed it.
+                if (watching != null) {
+                    announcing.add(entry.toProfiledInteraction());
+                }
+            }
+        }
+        for (ProfiledInteraction recorded : announcing) {
+            notifyWatchers(watching,
+                    listener -> listener.interactionRecorded(recorded));
+        }
+    }
+
+    /**
+     * Whether a panel is watching this tab, which is what makes it worth
+     * arranging the {@link #roundTripEnded(UI)} that would tell it. A tab whose
+     * developer has the panel closed records exactly as before and announces
+     * nothing.
+     */
+    @Override
+    public boolean isWatched(UI ui) {
+        if (ui == null) {
+            return false;
+        }
+        // Keyed outside the monitor: deriving the key reads the session, and
+        // this is asked once per invocation of every profiled tab.
+        UiKey key = key(ui);
+        synchronized (this) {
+            return listeners.containsKey(key);
+        }
     }
 
     /**
@@ -445,6 +512,18 @@ public class ProfileStore implements InteractionSink {
         }
         UiKey key = key(ui);
         synchronized (this) {
+            // What the tab already recorded reaches this listener as the
+            // profile it loads on subscribing, so it counts as announced: it
+            // would otherwise arrive a second time, as a backlog pushed on top
+            // of the list the panel has just drawn.
+            Profile profile = profiles.get(key);
+            if (profile != null) {
+                // Only the completed ones: an interaction still being handled
+                // is not in that profile either, and marking it here would
+                // lose the one row the developer is waiting for.
+                profile.interactions.stream().filter(Entry::isComplete)
+                        .forEach(entry -> entry.announced = true);
+            }
             listeners.computeIfAbsent(key, k -> new CopyOnWriteArrayList<>())
                     .add(listener);
         }
@@ -555,6 +634,13 @@ public class ProfileStore implements InteractionSink {
         private CapturedInteraction interaction;
         /** Created on the first query; most interactions run none. */
         private List<ProfiledQuery> queries;
+        /**
+         * Whether the watchers of this tab have been told about this entry, so
+         * that the end of every later round trip of the same tab passes over
+         * it. Also set for what a tab already held when a watcher subscribed,
+         * which that watcher loads rather than is pushed.
+         */
+        private boolean announced;
 
         Entry(long id, long startedNanos) {
             this.id = id;
