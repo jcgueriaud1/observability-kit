@@ -604,27 +604,58 @@ class ProfileStoreTest {
         store.listen(ui, watcher);
 
         store.add(interaction("session-a", 0, "click"));
+        store.roundTripEnded(ui);
         store.add(interaction("session-a", 0, "keydown"));
+        store.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of("click", "keydown"), watcher.events(),
                 "in the order they happened, unlike a profile");
+        store.roundTripEnded(ui);
+        Assertions.assertEquals(List.of("click", "keydown"), watcher.events(),
+                "and each of them once, however many round trips follow");
     }
 
     @Test
     void aPushedInteractionCarriesTheQueriesItRan() {
         // The panel draws a waterfall from the message it is pushed, so the
-        // children have to be on it — an interaction is complete when it is
-        // announced, and nothing goes back to the store for the rest.
+        // children have to be on it, whether the handler ran them itself —
+        // this one — or a data provider ran them afterwards.
         UI ui = tab("session-a", 0);
         Watcher watcher = new Watcher();
         store.listen(ui, watcher);
 
         addQuery(begin(ui), "select * from orders where id=?", 1);
         store.add(interaction("session-a", 0, "click"));
+        store.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of("select * from orders where id=?"),
                 watcher.interactions.get(0).queries().stream()
                         .map(ProfiledQuery::statement).toList());
+    }
+
+    @Test
+    void aPushedInteractionCarriesTheQueriesADataProviderRanAfterIt() {
+        // A Grid or a ComboBox does not load its data while the invocation
+        // runs: the invocation registers a flush and Flow runs it as the
+        // response is written, so the queries arrive after the interaction
+        // was captured. Announcing at capture time would hand the panel every
+        // data-loading interaction there is with none of the queries it ran —
+        // which is the one thing the developer opened the profiler for.
+        UI ui = tab("session-a", 0);
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+
+        long interactionId = begin(ui);
+        store.add(interaction("session-a", 0, "setRequestedRange"));
+        addQuery(interactionId, "select * from orders limit 50", 50);
+        store.roundTripEnded(ui);
+
+        Assertions.assertEquals(List.of("setRequestedRange"), watcher.events(),
+                "announced once, when the round trip that ran it was over");
+        Assertions.assertEquals(List.of("select * from orders limit 50"),
+                watcher.interactions.get(0).queries().stream()
+                        .map(ProfiledQuery::statement).toList(),
+                "with the query the data provider ran after the invocation");
     }
 
     @Test
@@ -636,11 +667,74 @@ class ProfileStoreTest {
         store.listen(ui, watcher);
 
         store.add(interaction("session-a", 1, "click"));
+        store.roundTripEnded(tab("session-a", 1));
         store.add(interaction("session-b", 0, "click"));
+        store.roundTripEnded(tab("session-b", 0));
         store.uiStateSampled(tab("session-a", 1), state(4000));
 
         Assertions.assertEquals(List.of(), watcher.events());
         Assertions.assertEquals(List.of(), watcher.states);
+    }
+
+    @Test
+    void aPanelThatSubscribesLateIsNotPushedTheBacklog() {
+        // A panel loads the tab's profile as it subscribes, so what the tab
+        // already did is on its list before any message arrives. Announcing
+        // that backlog on the next round trip would draw every one of those
+        // rows a second time.
+        UI ui = tab("session-a", 0);
+        store.add(interaction("session-a", 0, "click"));
+
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+        store.add(interaction("session-a", 0, "keydown"));
+        store.roundTripEnded(ui);
+
+        Assertions.assertEquals(List.of("keydown"), watcher.events(),
+                "only what the tab did after the panel subscribed");
+    }
+
+    @Test
+    void anInteractionInFlightWhenAPanelSubscribesStillReachesIt() {
+        // The click that opened the panel: it is being handled while the
+        // subscription is made, so it is in neither the profile the panel
+        // loads nor the backlog that load covers. It has to arrive as a
+        // message when it finishes.
+        UI ui = tab("session-a", 0);
+        long interactionId = begin(ui);
+
+        Watcher watcher = new Watcher();
+        store.listen(ui, watcher);
+        addQuery(interactionId, "select * from orders", 12);
+        store.add(interaction("session-a", 0, "click"));
+        store.roundTripEnded(ui);
+
+        Assertions.assertEquals(List.of("click"), watcher.events());
+        Assertions.assertEquals(1, watcher.interactions.get(0).queries().size(),
+                "with what it ran while the panel was subscribing");
+    }
+
+    @Test
+    void aTabIsWatchedOnlyWhileSomethingIsListeningToIt() {
+        // What the collector asks before arranging an announcement at all, so
+        // that a tab with no panel open pays for none of this.
+        UI ui = tab("session-a", 0);
+        Assertions.assertFalse(store.isWatched(ui));
+
+        Registration registration = store.listen(ui, new Watcher());
+        Assertions.assertTrue(store.isWatched(ui));
+
+        registration.remove();
+        Assertions.assertFalse(store.isWatched(ui));
+        Assertions.assertFalse(store.isWatched(null));
+    }
+
+    @Test
+    void endingARoundTripOfATabNobodyHasProfiledIsNotAFailure() {
+        Assertions.assertDoesNotThrow(() -> {
+            store.roundTripEnded(tab("session-a", 0));
+            store.roundTripEnded(null);
+        });
     }
 
     @Test
@@ -663,6 +757,7 @@ class ProfileStoreTest {
 
         registration.remove();
         store.add(interaction("session-a", 0, "click"));
+        store.roundTripEnded(ui);
         store.uiStateSampled(ui, state(4000));
 
         Assertions.assertEquals(List.of(), watcher.events());
@@ -680,6 +775,7 @@ class ProfileStoreTest {
 
         close(ui);
         store.add(interaction("session-a", 0, "click"));
+        store.roundTripEnded(ui);
 
         Assertions.assertEquals(List.of(), watcher.events());
     }
@@ -705,6 +801,7 @@ class ProfileStoreTest {
 
         Assertions.assertDoesNotThrow(() -> {
             store.add(interaction("session-a", 0, "click"));
+            store.roundTripEnded(ui);
             store.uiStateSampled(ui, state(4000));
         });
 

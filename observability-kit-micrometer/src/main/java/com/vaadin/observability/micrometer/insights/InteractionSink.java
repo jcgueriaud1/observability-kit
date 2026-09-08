@@ -46,4 +46,43 @@ public interface InteractionSink {
     default void begin(UI ui) {
         // Nothing to prepare for a sink that keeps only what it is handed.
     }
+
+    /**
+     * Signals that the round trip the interactions of this UI were handled in
+     * is over, so that whatever the sink does with a finished interaction can
+     * be done now rather than when the interaction itself was captured.
+     * <p>
+     * The two are not the same moment. A Grid or a ComboBox does not load its
+     * data while the invocation runs: the invocation registers a flush, and
+     * Flow runs it as the response is written. Everything such an interaction
+     * cost is therefore recorded <em>after</em> {@link #add} was called for it.
+     * <p>
+     * A sink that only keeps records has nothing to do here — a reader of it
+     * sees whatever has arrived by the time it reads. The {@link ProfileStore}
+     * does: it announces each interaction to the panels watching that tab, and
+     * an announcement made at capture time would carry none of those queries.
+     *
+     * @param ui
+     *            the UI whose round trip ended, may be {@code null}
+     */
+    default void roundTripEnded(UI ui) {
+        // Nothing to announce for a sink that only keeps records.
+    }
+
+    /**
+     * Whether anything is waiting to be told what this UI records, so that a
+     * caller can skip arranging the {@link #roundTripEnded(UI)} that would tell
+     * it.
+     * <p>
+     * Asked per UI rather than answered once, because it is the tab with a
+     * profiler panel open on it that has to pay for the arrangement, and no
+     * other tab of the same server.
+     *
+     * @param ui
+     *            the UI about to be handled, may be {@code null}
+     * @return {@code true} when {@link #roundTripEnded(UI)} would do something
+     */
+    default boolean isWatched(UI ui) {
+        return false;
+    }
 }
