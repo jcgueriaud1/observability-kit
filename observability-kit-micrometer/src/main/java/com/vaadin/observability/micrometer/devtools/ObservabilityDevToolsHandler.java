@@ -41,7 +41,6 @@ import com.vaadin.observability.micrometer.insights.ProfileListener;
 import com.vaadin.observability.micrometer.insights.ProfileStore;
 import com.vaadin.observability.micrometer.insights.ProfiledInteraction;
 import com.vaadin.observability.micrometer.insights.ProfiledQuery;
-import com.vaadin.observability.micrometer.insights.ProfiledQueryGroup;
 
 /**
  * Dev-mode bridge between the live Micrometer {@link MeterRegistry} and the
@@ -98,9 +97,7 @@ import com.vaadin.observability.micrometer.insights.ProfiledQueryGroup;
  *     "exceptionType": null, "exceptionMessage": null,
  *     "applicationFrame": null,
  *     "queries": [ { "kind": "jdbc", "sql": "select * from orders where id=?",
- *                    "rows": 1, "durationMs": 8, "startOffsetMs": 12 } ],
- *     "queryGroups": [ { "statement": "select * from orders where id=?",
- *                        "kind": "jdbc", "count": 100, "durationMs": 640 } ]
+ *                    "rows": 1, "durationMs": 8, "startOffsetMs": 12 } ]
  *   } ]
  * }
  * </pre>
@@ -113,14 +110,6 @@ import com.vaadin.observability.micrometer.insights.ProfiledQueryGroup;
  * for an interaction that ran none, and its {@code sql} is the statement text
  * for a JDBC query and what the component asked for in the case of a data
  * provider query, which is the closest thing that has to a statement.
- * <p>
- * {@code queryGroups} is the same queries with the ones that are the same query
- * counted together, most repeated first: the toolbar headline is read off it
- * without the panel having to know how a statement is parameterised —
- * {@code queries.length} queries, {@code queryGroups.length} different
- * statements, and any group whose {@code count} is above one is a view running
- * one query N times. Its {@code durationMs} is the group's total, which is what
- * fixing the duplication could win back.
  * <p>
  * <strong>Scope is the developer's own session.</strong> The UI is resolved
  * through {@link VaadinSession#getUIById(int)} of the session the dev-tools
@@ -551,18 +540,6 @@ public class ObservabilityDevToolsHandler implements DevToolsMessageHandler {
             queries.add(q);
         }
         json.put("queries", queries);
-
-        List<ProfiledQueryGroup> grouped = profiled.queryGroups();
-        List<Map<String, Object>> groups = new ArrayList<>(grouped.size());
-        for (ProfiledQueryGroup group : grouped) {
-            Map<String, Object> g = new LinkedHashMap<>();
-            g.put("statement", group.statement());
-            g.put("kind", group.kind());
-            g.put("count", group.count());
-            g.put("durationMs", group.durationMs());
-            groups.add(g);
-        }
-        json.put("queryGroups", groups);
         return json;
     }
 

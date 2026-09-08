@@ -131,29 +131,6 @@
                             <skip>${skip.js.tests}</skip>
                         </configuration>
                     </execution>
-                    <!--
-                        The Copilot panels' own suite. Same reason as above in a
-                        different place: the profiler panel is the only reader
-                        of the dev-tools profile payload, and nothing on the
-                        server side can tell whether it makes the right figures
-                        out of one, asks about the right tab, or puts a
-                        statement into an innerHTML as text.
-                    -->
-                    <execution>
-                        <id>devtools-panel-js-tests</id>
-                        <phase>test</phase>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>node</executable>
-                            <arguments>
-                                <argument>${project.basedir}/src/test/js/VaadinObservabilityDevTools.test.js</argument>
-                            </arguments>
-                            <!-- The suite exits non-zero on a failed check. -->
-                            <skip>${skip.js.tests}</skip>
-                        </configuration>
-                    </execution>
                 </executions>
             </plugin>
             <plugin>

@@ -301,53 +301,6 @@ class ObservabilityDevToolsHandlerTest {
     }
 
     @Test
-    void theQueriesThatAreTheSameQueryReachThePanelCounted() {
-        UI ui = ownTab(SESSION, UI_ID);
-        profiles.begin(ui);
-        long interactionId = VaadinTelemetryContext.interactionId(ui);
-        profiles.addQuery(interactionId, ProfiledQuery.KIND_JDBC,
-                "select * from orders", 100, 12, System.nanoTime());
-        // The N of an N+1: one lookup per row, differing only in the id.
-        for (int id = 1; id <= 100; id++) {
-            profiles.addQuery(interactionId, ProfiledQuery.KIND_JDBC,
-                    "select * from customer where id=" + id, 1, 6,
-                    System.nanoTime());
-        }
-        profiles.add(interaction(SESSION, UI_ID, "click"));
-
-        profile(UI_ID);
-
-        Map<String, Object> json = interactions().get(0);
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> groups = (List<Map<String, Object>>) json
-                .get("queryGroups");
-        Assertions.assertEquals(2, groups.size(),
-                "101 queries, two different statements");
-        Map<String, Object> worst = groups.get(0);
-        Assertions.assertEquals("select * from customer where id=?",
-                worst.get("statement"),
-                "the literal is parameterised away, which is what makes the "
-                        + "hundred lookups one statement");
-        Assertions.assertEquals(100, worst.get("count"),
-                "most repeated first, so the N+1 leads");
-        Assertions.assertEquals(ProfiledQuery.KIND_JDBC, worst.get("kind"));
-        Assertions.assertEquals(600L, worst.get("durationMs"),
-                "the group's total, being what fixing it could win back");
-        Assertions.assertEquals(1, groups.get(1).get("count"));
-    }
-
-    @Test
-    void anInteractionThatRanNoQueriesHasNoGroups() {
-        ownTab(SESSION, UI_ID);
-        profiles.add(interaction(SESSION, UI_ID, "click"));
-
-        profile(UI_ID);
-
-        Assertions.assertEquals(List.of(),
-                interactions().get(0).get("queryGroups"));
-    }
-
-    @Test
     void theProfileCarriesWhatTheTabItselfHolds() {
         UI ui = ownTab(SESSION, UI_ID);
         profiles.uiStateSampled(ui, new UiStateSample(812, 210, 2, 0,

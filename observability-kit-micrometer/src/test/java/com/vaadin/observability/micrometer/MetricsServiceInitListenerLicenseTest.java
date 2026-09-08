@@ -80,13 +80,15 @@ class MetricsServiceInitListenerLicenseTest {
             new MetricsServiceInitListener().serviceInit(event);
         }
 
-        // Five UI init listeners in development mode: the UiMetricsBinder,
+        // Four UI init listeners in development mode: the UiMetricsBinder,
         // the ErrorMetricsBinder (which re-instruments the session error
-        // handler), the dev-tools Copilot panel injector, the profile store
-        // following the tab, and the UI-state binder, which measures for that
-        // store even with the ui-state gauges off (the last three are skipped
-        // in production - see productionMode_registersWithoutCheckingLicense).
-        verify(service, times(5)).addUIInitListener(any(UIInitListener.class));
+        // handler), the profile store following the tab, and the UI-state
+        // binder, which measures for that store even with the ui-state gauges
+        // off (the last two are skipped in production - see
+        // productionMode_registersWithoutCheckingLicense). The Copilot panel
+        // needs none: it is registered as a @JsModule on this listener and
+        // reaches the browser through the application's frontend bundle.
+        verify(service, times(4)).addUIInitListener(any(UIInitListener.class));
         // Two request interceptors: request timing/errors, and the navigation
         // binder closing out navigations that never complete.
         verify(event, times(2)).addVaadinRequestInterceptor(
@@ -105,8 +107,8 @@ class MetricsServiceInitListenerLicenseTest {
             licenseChecker.verifyNoInteractions();
         }
 
-        // The UiMetricsBinder and the ErrorMetricsBinder; no dev-tools
-        // injector in production mode.
+        // The UiMetricsBinder and the ErrorMetricsBinder; the profiler and
+        // the state sampler it feeds are development-mode only.
         verify(service, times(2)).addUIInitListener(any(UIInitListener.class));
     }
 

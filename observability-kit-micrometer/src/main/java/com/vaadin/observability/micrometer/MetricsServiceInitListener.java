@@ -18,6 +18,7 @@ import io.micrometer.observation.ObservationRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.vaadin.flow.component.dependency.JsModule;
 import com.vaadin.flow.server.ServiceInitEvent;
 import com.vaadin.flow.server.VaadinRequest;
 import com.vaadin.flow.server.VaadinService;
@@ -53,7 +54,23 @@ import com.vaadin.observability.micrometer.trace.TracingExecutor;
  * {@link ObservabilitySettings#isTraces()} is on, the listener also wraps the
  * service's executor with a {@link TracingExecutor} so trace context flows
  * across the thread hops taken by tasks submitted to it.
+ *
+ * <h2>The dev-mode panel</h2>
+ * <p>
+ * The {@code @JsModule} is how the Vaadin Copilot panel gets into the page.
+ * Flow's dev-mode class scanner looks for frontend dependencies on the classes
+ * it finds in {@code com.vaadin.*} packages, and this listener is one, so the
+ * module is added to the application's frontend imports and compiled by the
+ * application's own Vite build — which is what lets the kit ship the panel as
+ * TypeScript without a frontend build of its own. Copilot registers its own
+ * version marker exactly this way.
+ * <p>
+ * {@code developmentOnly} keeps it out of every production bundle. The panel
+ * talks to {@code ObservabilityDevToolsHandler} over the dev-tools websocket,
+ * which in production does not exist, so a production bundle carrying it would
+ * be carrying a panel that cannot work.
  */
+@JsModule(value = "./observability-kit/view-profiler-panel.ts", developmentOnly = true)
 public class MetricsServiceInitListener implements VaadinServiceInitListener {
 
     private static final Logger LOGGER = LoggerFactory
@@ -242,11 +259,6 @@ public class MetricsServiceInitListener implements VaadinServiceInitListener {
         ProfileStore profiles = productionMode ? null
                 : installProfiler(event.getSource(), s);
         bind(event, r, or, s, profiles);
-        if (!productionMode) {
-            event.getSource()
-                    .addUIInitListener(uiEvent -> ObservabilityDevToolsClient
-                            .inject(uiEvent.getUI()));
-        }
     }
 
     /**
