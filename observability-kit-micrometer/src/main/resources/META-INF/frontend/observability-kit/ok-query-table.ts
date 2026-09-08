@@ -4,7 +4,7 @@
 import { LitElement, css, html, nothing } from 'lit';
 import type { TemplateResult } from 'lit';
 
-import { duration, prettySql, rows } from './format';
+import { duration, prettySql, rows, sumDuration } from './format';
 import type { Interaction, Query, QueryGroup } from './model';
 import { KIND_JDBC, ROWS_WARN, queryGroups, queryLabel } from './model';
 import { tokens } from './styles';
@@ -73,16 +73,19 @@ export class OkQueryTable extends LitElement {
       text-align: end;
     }
 
+    /* The statement gets what is left, and what is left is not much: the
+       panel is 720 px wide with a list down one side, so the three figure
+       columns are sized to their content rather than to comfort. */
     col.rows {
-      inline-size: 4rem;
+      inline-size: 3.2rem;
     }
 
     col.time {
-      inline-size: 5.5rem;
+      inline-size: 4.4rem;
     }
 
     col.flags {
-      inline-size: 8rem;
+      inline-size: 6.5rem;
     }
 
     td {
@@ -215,7 +218,7 @@ export class OkQueryTable extends LitElement {
         </td>
         <td class="right num">${rows(group.rows)}</td>
         <td class="right num">
-          ${duration(group.durationMs)}${expandable
+          ${sumDuration(group.durationMs, repeated)}${expandable
             ? html`<div class="muted">×${repeated}</div>`
             : nothing}
         </td>

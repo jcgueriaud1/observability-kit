@@ -232,12 +232,27 @@ is the panel the kit shipped before the profiler existed.
 
 The panel is Lit and TypeScript in the kit's `META-INF/frontend`, registered
 with `@JsModule(developmentOnly = true)` and compiled by the application's own
-Vite build, so the kit needs no frontend build of its own. One consequence is
-worth knowing: adding a frontend module means the application's development
-bundle no longer matches Vaadin's prebuilt default one, so the first
-development-mode start after adding the kit builds a bundle (`npm install` and
-Vite). Applications that already define frontend code of their own were
+Vite build, so the kit needs no frontend build of its own.
+
+One consequence is worth knowing: a frontend module means the application's
+development bundle no longer matches Vaadin's prebuilt default one, so the
+first development-mode start after adding the kit builds a bundle (`npm install`
+and Vite). Applications that already define frontend code of their own were
 building one anyway.
+
+If that build fails on `Cannot find module '@vaadin/…'` in
+`frontend/generated/vaadin.ts`, the application's classpath is missing the
+Vaadin component set that Copilot's own UI is built from. That happens only on
+a Flow classpath without the platform — `flow-server` alone — where nothing
+declares those npm packages and the default bundle was hiding it. Declaring the
+package set is enough:
+
+```java
+@NpmPackage(value = "@vaadin/react-components", version = "<platform version>")
+```
+
+An application built on the `vaadin` or `vaadin-core` artifact already has
+them.
 
 ## Other setups
 

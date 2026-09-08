@@ -500,12 +500,14 @@ const plugin = {
       tag: PANEL_TAG,
       // A plain element is not self-positioned the way Copilot's own
       // BasePanel is, and the panel manager skips viewport adjustment when no
-      // position is set -- so without this it opens off-screen.
+      // position is set -- so without this it opens off-screen. Taller than
+      // the meters panel this grew out of: the query table is the payoff, and
+      // at 460 it opened just below the fold every time.
       position: {
         top: 80,
         left: 80,
         width: 720,
-        height: 460
+        height: 620
       },
       toolbarOptions: {
         iconKey: 'barChart',

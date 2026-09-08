@@ -4,7 +4,7 @@
 import { LitElement, css, html, nothing } from 'lit';
 import type { TemplateResult } from 'lit';
 
-import { count, duration, frameFile, simpleName } from './format';
+import { count, duration, frameFile, simpleName, sumDuration } from './format';
 import type { Interaction, UiState } from './model';
 import {
   QUERY_WARN_COUNT, databaseMs, failed
@@ -189,7 +189,8 @@ export class OkProfilerHeader extends LitElement {
       this.chip('Database',
         queries === 0
           ? 'no queries'
-          : `${count(queries, 'query', 'queries')} · ${duration(databaseMs(interaction))}`,
+          : `${count(queries, 'query', 'queries')} · `
+            + `${sumDuration(databaseMs(interaction), queries)}`,
         queries >= QUERY_WARN_COUNT ? 'warn' : undefined)
     ];
     if (this.uiState !== null) {

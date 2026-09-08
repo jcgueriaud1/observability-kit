@@ -20,6 +20,16 @@ export function duration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+/**
+ * A total across several measurements. Each is whole milliseconds, so a run of
+ * sub-millisecond queries sums to zero -- which is true of the arithmetic and
+ * false of what happened. Anything that did work and rounded away is reported
+ * as under a millisecond rather than as none.
+ */
+export function sumDuration(ms: number, samples: number): string {
+  return ms === 0 && samples > 0 ? '< 1 ms' : duration(ms);
+}
+
 /** How stale a figure is, in the same two ranges. */
 export function ago(ms: number): string {
   if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) {
